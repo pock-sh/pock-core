@@ -25,15 +25,20 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
 
 pub fn seal_to(recipient: &KemPublic, plaintext: &[u8]) -> Envelope {
     let (kem_ct, shared) = recipient.encapsulate();
-    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &kem_ct.as_bytes(), INFO));
+    let ct_bytes = kem_ct.as_bytes();
+    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &ct_bytes, INFO));
     let aead = aead_seal(&key, plaintext);
-    Envelope { v: 1, kem_ct: b64(&kem_ct.as_bytes()), aead: b64(&aead) }
+    Envelope { v: 1, kem_ct: b64(&ct_bytes), aead: b64(&aead) }
 }
 
 pub fn open_with(secret: &KemSecret, env: &Envelope) -> Result<Vec<u8>> {
+    if env.v != 1 {
+        return Err(CoreError::Decode(format!("unsupported envelope version: {}", env.v)));
+    }
     let kem_ct = KemCiphertext::from_bytes(&unb64(&env.kem_ct)?)?;
     let shared = secret.decapsulate(&kem_ct);
-    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &kem_ct.as_bytes(), INFO));
+    let ct_bytes = kem_ct.as_bytes();
+    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &ct_bytes, INFO));
     aead_open(&key, &unb64(&env.aead)?)
 }
 
@@ -55,6 +60,14 @@ mod tests {
         let (sk_other, _pk_other) = kem_generate();
         let env = seal_to(&pk, b"secret");
         assert!(open_with(&sk_other, &env).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        let (sk, pk) = kem_generate();
+        let mut env = seal_to(&pk, b"x");
+        env.v = 2;
+        assert!(open_with(&sk, &env).is_err());
     }
 
     #[test]
