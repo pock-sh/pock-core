@@ -29,5 +29,13 @@ wasm-bindgen = { version = "0.2", optional = true }
 default = []
 wasm = ["dep:wasm-bindgen", "getrandom/js"]
 
+# On wasm32 the dependency tree pulls a SECOND getrandom major version (0.4, via
+# x-wing -> rand_core 0.10). That line removed the `js` feature; it needs the
+# `wasm_js` feature here PLUS the `--cfg getrandom_backend="wasm_js"` rustflag
+# set in .cargo/config.toml. Cargo unifies features across the same version, so
+# enabling wasm_js on this renamed alias also applies to x-wing's getrandom 0.4.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

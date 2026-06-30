@@ -8,3 +8,6 @@ pub mod identity;
 pub mod envelope;
 pub mod item;
 pub mod auk;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
