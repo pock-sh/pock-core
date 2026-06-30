@@ -11,8 +11,8 @@
 
 use crate::error::{CoreError, Result};
 use x_wing::{
-    Ciphertext, Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey, Kem, KeyExport,
-    XWingKem, CIPHERTEXT_SIZE, DECAPSULATION_KEY_SIZE,
+    Ciphertext, Decapsulate, Decapsulator, DecapsulationKey, Encapsulate, EncapsulationKey, Kem,
+    KeyExport, XWingKem, CIPHERTEXT_SIZE, DECAPSULATION_KEY_SIZE,
 };
 
 /// X-Wing KEM decapsulation (secret) key.
@@ -81,6 +81,14 @@ impl KemSecret {
         let mut ss_bytes = [0u8; 32];
         ss_bytes.copy_from_slice(&ss[..]);
         ss_bytes
+    }
+
+    /// Derive the encapsulation (public) key from this decapsulation (secret) key.
+    ///
+    /// Uses `x_wing::Decapsulator::encapsulation_key()` which retrieves the
+    /// `EncapsulationKey` stored inside the `DecapsulationKey` at construction time.
+    pub fn encapsulation_key(&self) -> KemPublic {
+        KemPublic(self.0.encapsulation_key().clone())
     }
 
     /// Serialize the secret key seed to bytes (32 bytes).
