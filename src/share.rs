@@ -1,5 +1,7 @@
 use crate::aead::{open as aead_open, seal as aead_seal, AeadKey};
+use crate::envelope::{open_with, seal_to, Envelope};
 use crate::error::{CoreError, Result};
+use crate::kem::{kem_generate, KemPublic, KemSecret};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +88,16 @@ fn unframe(envelope: &[u8]) -> Result<(ShareCipher, usize)> {
     Ok((ShareCipher::from_tag(envelope[5])?, 6))
 }
 
+fn u16_be(n: usize) -> [u8; 2] {
+    [((n >> 8) & 0xff) as u8, (n & 0xff) as u8]
+}
+fn read_u16_be(b: &[u8], off: usize) -> Result<usize> {
+    if off + 2 > b.len() {
+        return Err(CoreError::Decode("short xwing payload".into()));
+    }
+    Ok(((b[off] as usize) << 8) | (b[off + 1] as usize))
+}
+
 pub fn parse_key_blob(raw: &str) -> Result<(ShareCipher, Vec<u8>)> {
     // pock-key:v2:<cipher>:<b64url>
     let parts: Vec<&str> = raw.trim().splitn(4, ':').collect();
@@ -109,7 +121,17 @@ pub fn encrypt_share(bundle: &Bundle, cipher: ShareCipher) -> Result<(Vec<u8>, S
             let payload = aead_seal(&key, &data);
             Ok((frame(cipher, &payload), key_blob(cipher, key.as_bytes())))
         }
-        ShareCipher::Xwing => unimplemented!("task 2"),
+        ShareCipher::Xwing => {
+            let (sk, pk): (KemSecret, KemPublic) = kem_generate();
+            let env: Envelope = seal_to(&pk, &data);
+            let kem_ct = unb64(&env.kem_ct)?;
+            let aead_blob = unb64(&env.aead)?;
+            let mut payload = Vec::with_capacity(2 + kem_ct.len() + aead_blob.len());
+            payload.extend_from_slice(&u16_be(kem_ct.len()));
+            payload.extend_from_slice(&kem_ct);
+            payload.extend_from_slice(&aead_blob);
+            Ok((frame(cipher, &payload), key_blob(cipher, &sk.to_bytes())))
+        }
     }
 }
 
@@ -126,7 +148,18 @@ pub fn decrypt_share(envelope: &[u8], key_blob_str: &str) -> Result<Bundle> {
                 .map_err(|_| CoreError::Decode("xchacha key must be 32 bytes".into()))?;
             aead_open(&AeadKey::from_bytes(arr), payload)?
         }
-        ShareCipher::Xwing => unimplemented!("task 2"),
+        ShareCipher::Xwing => {
+            let kem_len = read_u16_be(payload, 0)?;
+            let kem_end = 2 + kem_len;
+            if kem_end > payload.len() {
+                return Err(CoreError::Decode("xwing kem_ct length out of range".into()));
+            }
+            let kem_ct = &payload[2..kem_end];
+            let aead_blob = &payload[kem_end..];
+            let env = Envelope { v: 1, kem_ct: b64(kem_ct), aead: b64(aead_blob) };
+            let sk = KemSecret::from_bytes(&key_bytes)?;
+            open_with(&sk, &env)?
+        }
     };
     serde_json::from_slice(&data).map_err(|e| CoreError::Decode(e.to_string()))
 }
@@ -177,5 +210,36 @@ mod tests {
         let (c, k) = parse_key_blob("pock-key:v2:xchacha:AAAA").unwrap();
         assert_eq!(c, ShareCipher::Xchacha);
         assert_eq!(k, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn xwing_roundtrip_multi_file() {
+        let b = Bundle {
+            v: 1,
+            files: vec![
+                EnvFile { name: ".env".into(), content: "A=1\n".into() },
+                EnvFile { name: ".env.prod".into(), content: "B=2\n".into() },
+            ],
+            note: None,
+        };
+        let (env, blob) = encrypt_share(&b, ShareCipher::Xwing).unwrap();
+        assert!(blob.starts_with("pock-key:v2:xwing:"));
+        assert_eq!(env[5], 2);
+        assert_eq!(decrypt_share(&env, &blob).unwrap(), b);
+    }
+
+    #[test]
+    fn cipher_algotag_mismatch_fails() {
+        let (env, _) = encrypt_share(&sample(), ShareCipher::Xwing).unwrap();
+        let (_, xchacha_blob) = encrypt_share(&sample(), ShareCipher::Xchacha).unwrap();
+        // xwing envelope + xchacha key blob must be rejected before any crypto.
+        assert!(decrypt_share(&env, &xchacha_blob).is_err());
+    }
+
+    #[test]
+    fn xwing_wrong_key_fails() {
+        let (env, _) = encrypt_share(&sample(), ShareCipher::Xwing).unwrap();
+        let (_, blob2) = encrypt_share(&sample(), ShareCipher::Xwing).unwrap();
+        assert!(decrypt_share(&env, &blob2).is_err());
     }
 }
