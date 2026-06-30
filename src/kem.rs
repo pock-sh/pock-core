@@ -10,6 +10,7 @@
 //! - Shared secret: 32 bytes
 
 use crate::error::{CoreError, Result};
+use zeroize::Zeroizing;
 use x_wing::{
     Ciphertext, Decapsulate, Decapsulator, DecapsulationKey, Encapsulate, EncapsulationKey, Kem,
     KeyExport, XWingKem, CIPHERTEXT_SIZE, DECAPSULATION_KEY_SIZE,
@@ -48,9 +49,9 @@ impl KemPublic {
     /// secret is used locally as key material.
     pub fn encapsulate(&self) -> (KemCiphertext, [u8; 32]) {
         let (ct, ss) = self.0.encapsulate();
-        let mut ss_bytes = [0u8; 32];
+        let mut ss_bytes = Zeroizing::new([0u8; 32]);
         ss_bytes.copy_from_slice(&ss[..]);
-        (KemCiphertext(ct), ss_bytes)
+        (KemCiphertext(ct), *ss_bytes)
     }
 
     /// Serialize the public key to bytes (1216 bytes).
@@ -78,9 +79,9 @@ impl KemSecret {
     /// pseudorandom (but distinct) value is returned rather than an error.
     pub fn decapsulate(&self, ct: &KemCiphertext) -> [u8; 32] {
         let ss = self.0.decapsulate(&ct.0);
-        let mut ss_bytes = [0u8; 32];
+        let mut ss_bytes = Zeroizing::new([0u8; 32]);
         ss_bytes.copy_from_slice(&ss[..]);
-        ss_bytes
+        *ss_bytes
     }
 
     /// Derive the encapsulation (public) key from this decapsulation (secret) key.

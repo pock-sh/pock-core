@@ -4,6 +4,7 @@ use crate::kdf::hkdf_sha256;
 use crate::kem::{KemCiphertext, KemPublic, KemSecret};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 const INFO: &[u8] = b"pock/envelope/v1";
 
@@ -25,8 +26,9 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
 
 pub fn seal_to(recipient: &KemPublic, plaintext: &[u8]) -> Envelope {
     let (kem_ct, shared) = recipient.encapsulate();
+    let shared = Zeroizing::new(shared);
     let ct_bytes = kem_ct.as_bytes();
-    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &ct_bytes, INFO));
+    let key = AeadKey::from_bytes(hkdf_sha256(&shared[..], &ct_bytes, INFO));
     let aead = aead_seal(&key, plaintext);
     Envelope { v: 1, kem_ct: b64(&ct_bytes), aead: b64(&aead) }
 }
@@ -36,9 +38,9 @@ pub fn open_with(secret: &KemSecret, env: &Envelope) -> Result<Vec<u8>> {
         return Err(CoreError::Decode(format!("unsupported envelope version: {}", env.v)));
     }
     let kem_ct = KemCiphertext::from_bytes(&unb64(&env.kem_ct)?)?;
-    let shared = secret.decapsulate(&kem_ct);
+    let shared = Zeroizing::new(secret.decapsulate(&kem_ct));
     let ct_bytes = kem_ct.as_bytes();
-    let key = AeadKey::from_bytes(hkdf_sha256(&shared, &ct_bytes, INFO));
+    let key = AeadKey::from_bytes(hkdf_sha256(&shared[..], &ct_bytes, INFO));
     aead_open(&key, &unb64(&env.aead)?)
 }
 

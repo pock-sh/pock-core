@@ -42,7 +42,7 @@ pub fn wasm_encrypt_item(value: &str, recipient_pub_blobs_json: &str) -> Result<
     for b in &blobs {
         recipients.push(PublicIdentity::from_blob(b).map_err(|e| JsError::new(&e.to_string()))?.kem);
     }
-    let item = encrypt_item(value.as_bytes(), &recipients);
+    let item = encrypt_item(value.as_bytes(), &recipients).map_err(|e| JsError::new(&e.to_string()))?;
     serde_json::to_string(&item).map_err(|e| JsError::new(&e.to_string()))
 }
 

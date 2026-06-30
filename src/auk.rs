@@ -5,11 +5,13 @@ use crate::kdf::{argon2id, hkdf_sha256, KdfProfile};
 use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const SKD_INFO: &[u8] = b"pock/2skd/v1";
 
 pub struct Auk(AeadKey);
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey([u8; 16]);
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -49,16 +51,17 @@ impl SecretKey {
 }
 
 fn derive_passphrase_kek(passphrase: &[u8], salt: &[u8], secret_key: &SecretKey, profile: KdfProfile) -> Result<[u8; 32]> {
-    let stretched = argon2id(passphrase, salt, profile)?;
-    Ok(hkdf_sha256(&stretched, secret_key.as_bytes(), SKD_INFO))
+    let stretched = Zeroizing::new(argon2id(passphrase, salt, profile)?);
+    let kek = Zeroizing::new(hkdf_sha256(&stretched[..], secret_key.as_bytes(), SKD_INFO));
+    Ok(*kek)
 }
 
 pub fn wrap_with_passphrase(auk: &Auk, passphrase: &[u8], secret_key: &SecretKey, profile: KdfProfile) -> WrappedAuk {
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let (m, t, p) = profile.params();
-    let kek = derive_passphrase_kek(passphrase, &salt, secret_key, profile).expect("argon2 params valid");
-    let blob = aead_seal(&AeadKey::from_bytes(kek), auk.key().as_bytes());
+    let kek = Zeroizing::new(derive_passphrase_kek(passphrase, &salt, secret_key, profile).expect("argon2 params valid"));
+    let blob = aead_seal(&AeadKey::from_bytes(*kek), auk.key().as_bytes());
     WrappedAuk { v: 1, method: "passphrase".into(), salt: b64(&salt), m_kib: m, t, p, blob: b64(&blob) }
 }
 
@@ -69,10 +72,10 @@ pub fn unwrap_with_passphrase(w: &WrappedAuk, passphrase: &[u8], secret_key: &Se
     let salt = unb64(&w.salt)?;
     // Reconstruct the profile from stored params (only Native/Constrained are emitted, but honor stored values).
     let profile = if (w.m_kib, w.t, w.p) == KdfProfile::Native.params() { KdfProfile::Native } else { KdfProfile::Constrained };
-    let kek = derive_passphrase_kek(passphrase, &salt, secret_key, profile)?;
-    let auk_bytes = aead_open(&AeadKey::from_bytes(kek), &unb64(&w.blob)?)?;
-    let arr: [u8; 32] = auk_bytes.as_slice().try_into().map_err(|_| CoreError::Decode("auk len".into()))?;
-    Ok(Auk::from_key(AeadKey::from_bytes(arr)))
+    let kek = Zeroizing::new(derive_passphrase_kek(passphrase, &salt, secret_key, profile)?);
+    let auk_bytes = Zeroizing::new(aead_open(&AeadKey::from_bytes(*kek), &unb64(&w.blob)?)?);
+    let arr: Zeroizing<[u8; 32]> = Zeroizing::new(auk_bytes.as_slice().try_into().map_err(|_| CoreError::Decode("auk len".into()))?);
+    Ok(Auk::from_key(AeadKey::from_bytes(*arr)))
 }
 
 pub fn wrap_with_kek(auk: &Auk, kek: &[u8; 32], method: &str) -> WrappedAuk {
@@ -84,17 +87,18 @@ pub fn unwrap_with_kek(w: &WrappedAuk, kek: &[u8; 32]) -> Result<Auk> {
     if w.v != 1 {
         return Err(CoreError::Decode(format!("unsupported wrapped-auk version: {}", w.v)));
     }
-    let auk_bytes = aead_open(&AeadKey::from_bytes(*kek), &unb64(&w.blob)?)?;
-    let arr: [u8; 32] = auk_bytes.as_slice().try_into().map_err(|_| CoreError::Decode("auk len".into()))?;
-    Ok(Auk::from_key(AeadKey::from_bytes(arr)))
+    let auk_bytes = Zeroizing::new(aead_open(&AeadKey::from_bytes(*kek), &unb64(&w.blob)?)?);
+    let arr: Zeroizing<[u8; 32]> = Zeroizing::new(auk_bytes.as_slice().try_into().map_err(|_| CoreError::Decode("auk len".into()))?);
+    Ok(Auk::from_key(AeadKey::from_bytes(*arr)))
 }
 
 pub fn wrap_identity(auk: &Auk, id: &Identity) -> String {
-    b64(&aead_seal(auk.key(), &id.to_secret_bytes()))
+    let secret = Zeroizing::new(id.to_secret_bytes());
+    b64(&aead_seal(auk.key(), &secret))
 }
 
 pub fn unwrap_identity(auk: &Auk, wrapped: &str) -> Result<Identity> {
-    let secret = aead_open(auk.key(), &unb64(wrapped)?)?;
+    let secret = Zeroizing::new(aead_open(auk.key(), &unb64(wrapped)?)?);
     Identity::from_secret_bytes(&secret)
 }
 
