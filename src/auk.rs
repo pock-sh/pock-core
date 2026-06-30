@@ -155,4 +155,13 @@ mod tests {
         w.v = 2;
         assert!(unwrap_with_passphrase(&w, b"pw", &sk).is_err());
     }
+
+    #[test]
+    fn rejects_unknown_wrapped_auk_version_kek() {
+        let auk = Auk::generate();
+        let kek = [9u8; 32];
+        let mut w = wrap_with_kek(&auk, &kek, "webauthn-prf");
+        w.v = 2;
+        assert!(unwrap_with_kek(&w, &kek).is_err());
+    }
 }
