@@ -1,6 +1,6 @@
 #![cfg(feature = "wasm")]
 use crate::auk::{
-    unwrap_identity, unwrap_with_passphrase, wrap_identity, wrap_with_kek,
+    unwrap_identity, unwrap_with_kek, unwrap_with_passphrase, wrap_identity, wrap_with_kek,
     wrap_with_passphrase, Auk, SecretKey, WrappedAuk,
 };
 use crate::identity::{Identity, PublicIdentity, PublicIdentityBlob};
@@ -120,6 +120,44 @@ pub fn wasm_unlock_vault(
     let wrapped_auk: WrappedAuk = serde_json::from_str(wrapped_auk_json).map_err(|e| JsError::new(&e.to_string()))?;
     let auk = unwrap_with_passphrase(&wrapped_auk, passphrase.as_bytes(), &secret_key)
         .map_err(|_| JsError::new("wrong passphrase or secret key"))?;
+    let identity = unwrap_identity(&auk, wrapped_identity_b64).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(serde_json::json!({ "identitySecretB64": b64(&identity.to_secret_bytes()) }).to_string())
+}
+
+const PRF_INFO: &[u8] = b"pock/webauthn-prf/v1";
+
+fn prf_kek(prf_secret_b64: &str) -> Result<[u8; 32], JsError> {
+    let secret = unb64(prf_secret_b64)?;
+    Ok(hkdf_sha256(&secret, b"", PRF_INFO))
+}
+
+#[wasm_bindgen]
+pub fn wasm_enroll_prf(
+    passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+    prf_secret_b64: &str,
+) -> Result<String, JsError> {
+    let sk_bytes = unb64(secret_key_b64)?;
+    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| JsError::new("bad secret key"))?;
+    let secret_key = SecretKey::from_bytes(sk_arr);
+    let wrapped_auk: WrappedAuk = serde_json::from_str(wrapped_auk_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let auk = unwrap_with_passphrase(&wrapped_auk, passphrase.as_bytes(), &secret_key)
+        .map_err(|_| JsError::new("wrong passphrase or secret key"))?;
+    let kek = prf_kek(prf_secret_b64)?;
+    let wrapped_prf = wrap_with_kek(&auk, &kek, "webauthn-prf");
+    serde_json::to_string(&wrapped_prf).map_err(|e| JsError::new(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_unlock_prf(
+    prf_secret_b64: &str,
+    wrapped_auk_prf_json: &str,
+    wrapped_identity_b64: &str,
+) -> Result<String, JsError> {
+    let wrapped_prf: WrappedAuk = serde_json::from_str(wrapped_auk_prf_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let kek = prf_kek(prf_secret_b64)?;
+    let auk = unwrap_with_kek(&wrapped_prf, &kek).map_err(|_| JsError::new("touch id unlock failed"))?;
     let identity = unwrap_identity(&auk, wrapped_identity_b64).map_err(|e| JsError::new(&e.to_string()))?;
     Ok(serde_json::json!({ "identitySecretB64": b64(&identity.to_secret_bytes()) }).to_string())
 }

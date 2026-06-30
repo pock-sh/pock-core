@@ -1,6 +1,6 @@
 #![cfg(all(target_arch = "wasm32", feature = "wasm"))]
 use wasm_bindgen_test::*;
-use pock_core::wasm::{wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_generate_identity, wasm_unlock_vault};
+use pock_core::wasm::{wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_enroll_prf, wasm_generate_identity, wasm_unlock_prf, wasm_unlock_vault};
 
 #[wasm_bindgen_test]
 fn share_roundtrip_both_ciphers() {
@@ -54,4 +54,21 @@ fn unlock_wrong_passphrase_fails() {
         v["wrappedIdentity"].as_str().unwrap(),
     );
     assert!(res.is_err());
+}
+
+#[wasm_bindgen_test]
+fn enroll_then_unlock_prf() {
+    let created = wasm_create_vault("pw").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+    let sk = v["secretKey"].as_str().unwrap();
+    let wpp = serde_json::to_string(&v["wrappedAukPassphrase"]).unwrap();
+    let wid = v["wrappedIdentity"].as_str().unwrap();
+
+    // 43 base64url 'A's decode to 32 zero bytes - a fixed stand-in for the
+    // authenticator's PRF output.
+    let prf_secret = "A".repeat(43);
+    let wrapped_prf = wasm_enroll_prf("pw", sk, &wpp, &prf_secret).unwrap();
+    let unlocked = wasm_unlock_prf(&prf_secret, &wrapped_prf, wid).unwrap();
+    let u: serde_json::Value = serde_json::from_str(&unlocked).unwrap();
+    assert_eq!(u["identitySecretB64"].as_str().unwrap(), v["identitySecretB64"].as_str().unwrap());
 }
