@@ -7,3 +7,4 @@ pub mod kem;
 pub mod identity;
 pub mod envelope;
 pub mod item;
+pub mod auk;
