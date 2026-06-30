@@ -5,3 +5,4 @@ pub mod kdf;
 pub mod sign;
 pub mod kem;
 pub mod identity;
+pub mod envelope;
