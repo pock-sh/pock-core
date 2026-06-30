@@ -1,6 +1,19 @@
 #![cfg(all(target_arch = "wasm32", feature = "wasm"))]
 use wasm_bindgen_test::*;
-use pock_core::wasm::{wasm_decrypt_item, wasm_encrypt_item, wasm_generate_identity};
+use pock_core::wasm::{wasm_decrypt_item, wasm_encrypt_item, wasm_generate_identity, wasm_encrypt_share, wasm_decrypt_share};
+
+#[wasm_bindgen_test]
+fn share_roundtrip_both_ciphers() {
+    let bundle = r#"{"v":1,"files":[{"name":".env","content":"K=V\n"}]}"#;
+    for cipher in ["xchacha", "xwing"] {
+        let enc = wasm_encrypt_share(bundle, cipher).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&enc).unwrap();
+        let env_b64 = v["envelope_b64"].as_str().unwrap();
+        let blob = v["key_blob"].as_str().unwrap();
+        let back = wasm_decrypt_share(env_b64, blob).unwrap();
+        assert!(back.contains("K=V"));
+    }
+}
 
 #[wasm_bindgen_test]
 fn end_to_end_identity_item_roundtrip() {

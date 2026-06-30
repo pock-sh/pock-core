@@ -1,6 +1,7 @@
 #![cfg(feature = "wasm")]
 use crate::identity::{Identity, PublicIdentity, PublicIdentityBlob};
 use crate::item::{decrypt_item, encrypt_item, EncryptedItem};
+use crate::share::{decrypt_share, encrypt_share, Bundle, ShareCipher};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -54,4 +55,20 @@ pub fn wasm_decrypt_item(item_json: &str, identity_secret_b64: &str) -> Result<S
     let pub_kem = id.public().kem;
     let plaintext = decrypt_item(&item, &id.kem, &pub_kem).map_err(|e| JsError::new(&e.to_string()))?;
     String::from_utf8(plaintext).map_err(|e| JsError::new(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_encrypt_share(bundle_json: &str, cipher_id: &str) -> Result<String, JsError> {
+    let bundle: Bundle = serde_json::from_str(bundle_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let cipher = ShareCipher::from_id(cipher_id).ok_or_else(|| JsError::new("unknown cipher id"))?;
+    let (envelope, key_blob) = encrypt_share(&bundle, cipher).map_err(|e| JsError::new(&e.to_string()))?;
+    let out = serde_json::json!({ "envelope_b64": b64(&envelope), "key_blob": key_blob });
+    Ok(out.to_string())
+}
+
+#[wasm_bindgen]
+pub fn wasm_decrypt_share(envelope_b64: &str, key_blob: &str) -> Result<String, JsError> {
+    let envelope = unb64(envelope_b64)?;
+    let bundle = decrypt_share(&envelope, key_blob).map_err(|e| JsError::new(&e.to_string()))?;
+    serde_json::to_string(&bundle).map_err(|e| JsError::new(&e.to_string()))
 }
