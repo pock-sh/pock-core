@@ -1,0 +1,181 @@
+use crate::aead::{open as aead_open, seal as aead_seal, AeadKey};
+use crate::error::{CoreError, Result};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+
+const MAGIC: &[u8; 4] = b"PKEV";
+const VERSION: u8 = 2;
+const TAG_XCHACHA: u8 = 1;
+const TAG_XWING: u8 = 2;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EnvFile {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Bundle {
+    pub v: u8,
+    pub files: Vec<EnvFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareCipher {
+    Xchacha,
+    Xwing,
+}
+
+impl ShareCipher {
+    pub fn id(&self) -> &'static str {
+        match self {
+            ShareCipher::Xchacha => "xchacha",
+            ShareCipher::Xwing => "xwing",
+        }
+    }
+    pub fn from_id(s: &str) -> Option<ShareCipher> {
+        match s {
+            "xchacha" => Some(ShareCipher::Xchacha),
+            "xwing" => Some(ShareCipher::Xwing),
+            _ => None,
+        }
+    }
+    fn tag(&self) -> u8 {
+        match self {
+            ShareCipher::Xchacha => TAG_XCHACHA,
+            ShareCipher::Xwing => TAG_XWING,
+        }
+    }
+    fn from_tag(t: u8) -> Result<ShareCipher> {
+        match t {
+            TAG_XCHACHA => Ok(ShareCipher::Xchacha),
+            TAG_XWING => Ok(ShareCipher::Xwing),
+            _ => Err(CoreError::Decode(format!("unknown share algoTag: {t}"))),
+        }
+    }
+}
+
+fn b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+fn unb64(s: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.trim())
+        .map_err(|e| CoreError::Decode(e.to_string()))
+}
+
+fn frame(cipher: ShareCipher, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + payload.len());
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.push(cipher.tag());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Returns (cipher, payload-slice-start-index) after validating MAGIC + version.
+fn unframe(envelope: &[u8]) -> Result<(ShareCipher, usize)> {
+    if envelope.len() < 6 || &envelope[0..4] != MAGIC {
+        return Err(CoreError::Decode("bad share envelope magic".into()));
+    }
+    if envelope[4] != VERSION {
+        return Err(CoreError::Decode(format!("unsupported share version: {}", envelope[4])));
+    }
+    Ok((ShareCipher::from_tag(envelope[5])?, 6))
+}
+
+pub fn parse_key_blob(raw: &str) -> Result<(ShareCipher, Vec<u8>)> {
+    // pock-key:v2:<cipher>:<b64url>
+    let parts: Vec<&str> = raw.trim().splitn(4, ':').collect();
+    if parts.len() != 4 || parts[0] != "pock-key" || parts[1] != "v2" {
+        return Err(CoreError::Decode("invalid key blob (expected pock-key:v2:...)".into()));
+    }
+    let cipher = ShareCipher::from_id(parts[2])
+        .ok_or_else(|| CoreError::Decode(format!("unknown cipher in key blob: {}", parts[2])))?;
+    Ok((cipher, unb64(parts[3])?))
+}
+
+fn key_blob(cipher: ShareCipher, key_bytes: &[u8]) -> String {
+    format!("pock-key:v2:{}:{}", cipher.id(), b64(key_bytes))
+}
+
+pub fn encrypt_share(bundle: &Bundle, cipher: ShareCipher) -> Result<(Vec<u8>, String)> {
+    let data = serde_json::to_vec(bundle).map_err(|e| CoreError::Decode(e.to_string()))?;
+    match cipher {
+        ShareCipher::Xchacha => {
+            let key = AeadKey::random();
+            let payload = aead_seal(&key, &data);
+            Ok((frame(cipher, &payload), key_blob(cipher, key.as_bytes())))
+        }
+        ShareCipher::Xwing => unimplemented!("task 2"),
+    }
+}
+
+pub fn decrypt_share(envelope: &[u8], key_blob_str: &str) -> Result<Bundle> {
+    let (env_cipher, off) = unframe(envelope)?;
+    let (blob_cipher, key_bytes) = parse_key_blob(key_blob_str)?;
+    if env_cipher != blob_cipher {
+        return Err(CoreError::Decode("key blob cipher does not match envelope".into()));
+    }
+    let payload = &envelope[off..];
+    let data = match env_cipher {
+        ShareCipher::Xchacha => {
+            let arr: [u8; 32] = key_bytes.as_slice().try_into()
+                .map_err(|_| CoreError::Decode("xchacha key must be 32 bytes".into()))?;
+            aead_open(&AeadKey::from_bytes(arr), payload)?
+        }
+        ShareCipher::Xwing => unimplemented!("task 2"),
+    };
+    serde_json::from_slice(&data).map_err(|e| CoreError::Decode(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Bundle {
+        Bundle {
+            v: 1,
+            files: vec![EnvFile { name: ".env".into(), content: "API_KEY=secret123\n".into() }],
+            note: Some("hi".into()),
+        }
+    }
+
+    #[test]
+    fn xchacha_roundtrip() {
+        let (env, blob) = encrypt_share(&sample(), ShareCipher::Xchacha).unwrap();
+        assert_eq!(decrypt_share(&env, &blob).unwrap(), sample());
+        assert!(blob.starts_with("pock-key:v2:xchacha:"));
+        assert_eq!(&env[0..4], b"PKEV");
+        assert_eq!(env[4], 2);
+        assert_eq!(env[5], 1);
+    }
+
+    #[test]
+    fn xchacha_wrong_key_fails() {
+        let (env, _blob) = encrypt_share(&sample(), ShareCipher::Xchacha).unwrap();
+        let (_e2, blob2) = encrypt_share(&sample(), ShareCipher::Xchacha).unwrap();
+        assert!(decrypt_share(&env, &blob2).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_version() {
+        let (mut env, blob) = encrypt_share(&sample(), ShareCipher::Xchacha).unwrap();
+        let mut bad = env.clone();
+        bad[0] = b'X';
+        assert!(decrypt_share(&bad, &blob).is_err());
+        env[4] = 9;
+        assert!(decrypt_share(&env, &blob).is_err());
+    }
+
+    #[test]
+    fn parse_key_blob_rejects_v1_and_junk() {
+        assert!(parse_key_blob("pock-key:v1:xchacha20poly1305:AAAA").is_err());
+        assert!(parse_key_blob("nope").is_err());
+        let (c, k) = parse_key_blob("pock-key:v2:xchacha:AAAA").unwrap();
+        assert_eq!(c, ShareCipher::Xchacha);
+        assert_eq!(k, vec![0, 0, 0]);
+    }
+}
