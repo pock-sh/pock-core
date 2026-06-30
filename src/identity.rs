@@ -66,8 +66,8 @@ impl Identity {
     /// Returns [`CoreError::Decode`] if the slice is too short or either key
     /// seed is invalid.
     pub fn from_secret_bytes(b: &[u8]) -> Result<Self> {
-        if b.len() < 32 {
-            return Err(CoreError::Decode("identity secret too short".into()));
+        if b.len() != 64 {
+            return Err(CoreError::Decode("identity secret must be 64 bytes".into()));
         }
         let (sign_b, kem_b) = b.split_at(32);
         let sign_arr: [u8; 32] = sign_b
@@ -81,34 +81,31 @@ impl Identity {
 }
 
 impl PublicIdentity {
-    /// Serialize to a versioned JSON blob with base64url-encoded keys.
-    pub fn to_blob(&self) -> String {
-        let blob = PublicIdentityBlob {
+    /// Serialize to a versioned struct blob with base64url-encoded keys.
+    pub fn to_blob(&self) -> PublicIdentityBlob {
+        PublicIdentityBlob {
             v: 1,
             sign: b64(self.sign.as_bytes()),
             kem: b64(&self.kem.as_bytes()),
-        };
-        serde_json::to_string(&blob).expect("PublicIdentityBlob always serializes")
+        }
     }
 
     /// Deserialize from a blob produced by [`to_blob`].
     ///
     /// # Errors
-    /// Returns [`CoreError::Decode`] if the JSON is invalid, the version is
-    /// unrecognized, or either key fails validation.
-    pub fn from_blob(blob: &str) -> Result<Self> {
-        let b: PublicIdentityBlob = serde_json::from_str(blob)
-            .map_err(|e| CoreError::Decode(e.to_string()))?;
-        if b.v != 1 {
-            return Err(CoreError::Decode(format!("unknown identity blob version {}", b.v)));
+    /// Returns [`CoreError::Decode`] if the version is unrecognized, a base64
+    /// field is invalid, or either key fails validation.
+    pub fn from_blob(blob: &PublicIdentityBlob) -> Result<Self> {
+        if blob.v != 1 {
+            return Err(CoreError::Decode(format!("unknown identity blob version {}", blob.v)));
         }
-        let sign_bytes = unb64(&b.sign)?;
+        let sign_bytes = unb64(&blob.sign)?;
         let sign_arr: [u8; 32] = sign_bytes
             .as_slice()
             .try_into()
             .map_err(|_| CoreError::Decode("sign public key len".into()))?;
         let sign = SignPublic::from_bytes(sign_arr);
-        let kem_bytes = unb64(&b.kem)?;
+        let kem_bytes = unb64(&blob.kem)?;
         let kem = KemPublic::from_bytes(&kem_bytes)?;
         Ok(PublicIdentity { sign, kem })
     }
