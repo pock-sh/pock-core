@@ -242,4 +242,13 @@ mod tests {
         let (_, blob2) = encrypt_share(&sample(), ShareCipher::Xwing).unwrap();
         assert!(decrypt_share(&env, &blob2).is_err());
     }
+
+    #[test]
+    fn xwing_oversized_kem_len_is_rejected() {
+        // PKEV | v2 | TAG_XWING | u16=0xFFFF | (no further bytes)
+        let env = vec![b'P', b'K', b'E', b'V', 2, 2, 0xFF, 0xFF];
+        // any syntactically valid xwing key blob; decrypt must Err, not panic
+        let blob = "pock-key:v2:xwing:AAAA";
+        assert!(decrypt_share(&env, blob).is_err());
+    }
 }
