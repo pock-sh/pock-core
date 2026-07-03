@@ -124,6 +124,46 @@ pub fn wasm_unlock_vault(
     Ok(serde_json::json!({ "identitySecretB64": b64(&identity.to_secret_bytes()) }).to_string())
 }
 
+/// Unlock using ONLY the recovery code (a single high-entropy factor). No passphrase or
+/// Secret Key needed — this is the "I forgot my passphrase" path.
+#[wasm_bindgen]
+pub fn wasm_unlock_recovery(
+    recovery_code: &str,
+    wrapped_recovery_json: &str,
+    wrapped_identity_b64: &str,
+) -> Result<String, JsError> {
+    let wrapped_rec: WrappedAuk =
+        serde_json::from_str(wrapped_recovery_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let recovery_kek = hkdf_sha256(recovery_code.trim().as_bytes(), b"", b"pock/recovery/v1");
+    let auk = unwrap_with_kek(&wrapped_rec, &recovery_kek).map_err(|_| JsError::new("wrong recovery code"))?;
+    let identity = unwrap_identity(&auk, wrapped_identity_b64).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(serde_json::json!({ "identitySecretB64": b64(&identity.to_secret_bytes()) }).to_string())
+}
+
+/// After a recovery unlock, re-wrap the AUK under a NEW passphrase (+ the Secret Key), so
+/// the user can set a passphrase they'll remember. Returns the new wrappedAukPassphrase to
+/// register server-side. The identity keypair itself is unchanged.
+#[wasm_bindgen]
+pub fn wasm_reset_passphrase(
+    recovery_code: &str,
+    wrapped_recovery_json: &str,
+    secret_key_b64: &str,
+    new_passphrase: &str,
+) -> Result<String, JsError> {
+    let wrapped_rec: WrappedAuk =
+        serde_json::from_str(wrapped_recovery_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let recovery_kek = hkdf_sha256(recovery_code.trim().as_bytes(), b"", b"pock/recovery/v1");
+    let auk = unwrap_with_kek(&wrapped_rec, &recovery_kek).map_err(|_| JsError::new("wrong recovery code"))?;
+    let sk_bytes = unb64(secret_key_b64)?;
+    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| JsError::new("bad secret key"))?;
+    let secret_key = SecretKey::from_bytes(sk_arr);
+    let wrapped_pp = wrap_with_passphrase(&auk, new_passphrase.as_bytes(), &secret_key, KdfProfile::Constrained);
+    Ok(serde_json::json!({
+        "wrappedAukPassphrase": serde_json::to_value(&wrapped_pp).map_err(|e| JsError::new(&e.to_string()))?,
+    })
+    .to_string())
+}
+
 const PRF_INFO: &[u8] = b"pock/webauthn-prf/v1";
 
 fn prf_kek(prf_secret_b64: &str) -> Result<[u8; 32], JsError> {
