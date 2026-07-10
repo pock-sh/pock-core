@@ -9,6 +9,7 @@ use crate::identity::{Identity, PublicIdentity, PublicIdentityBlob};
 use crate::item::{decrypt_item, encrypt_item, EncryptedItem};
 use crate::kdf::{hkdf_sha256, KdfProfile};
 use crate::share::{decrypt_share, encrypt_share, Bundle, ShareCipher};
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -206,6 +207,119 @@ pub fn wasm_verify_message(sign_pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> 
     let sig_bytes = unb64(sig_b64)?;
     let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| JsError::new("bad signature length"))?;
     Ok(SignPublic::from_bytes(pk_arr).verify(msg, &sig_arr).is_ok())
+}
+
+fn parse_sk(secret_key_b64: &str) -> Result<SecretKey, JsError> {
+    let sk_bytes = unb64(secret_key_b64)?;
+    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| JsError::new("bad secret key"))?;
+    Ok(SecretKey::from_bytes(sk_arr))
+}
+
+fn unlock_auk(passphrase: &str, secret_key_b64: &str, wrapped_auk_json: &str) -> Result<Auk, JsError> {
+    let wrapped: WrappedAuk = serde_json::from_str(wrapped_auk_json).map_err(|e| JsError::new(&e.to_string()))?;
+    unwrap_with_passphrase(&wrapped, passphrase.as_bytes(), &parse_sk(secret_key_b64)?)
+        .map_err(|_| JsError::new("wrong passphrase or secret key"))
+}
+
+/// Change the passphrase while unlocked (old passphrase known). The AUK,
+/// identity, recovery code, and passkeys are all unchanged — this only
+/// re-wraps the AUK under the new passphrase + same Secret Key.
+#[wasm_bindgen]
+pub fn wasm_change_passphrase(
+    old_passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+    new_passphrase: &str,
+) -> Result<String, JsError> {
+    let auk = unlock_auk(old_passphrase, secret_key_b64, wrapped_auk_json)?;
+    let wrapped = wrap_with_passphrase(&auk, new_passphrase.as_bytes(), &parse_sk(secret_key_b64)?, KdfProfile::Constrained);
+    Ok(serde_json::json!({
+        "wrappedAukPassphrase": serde_json::to_value(&wrapped).map_err(|e| JsError::new(&e.to_string()))?,
+    })
+    .to_string())
+}
+
+/// Rotate the Secret Key (the "have" factor). Mints a fresh 16-byte key and
+/// re-wraps the AUK under passphrase + new key. Recovery and passkey wraps
+/// are KEK-based and unaffected.
+#[wasm_bindgen]
+pub fn wasm_rotate_secret_key(
+    passphrase: &str,
+    old_secret_key_b64: &str,
+    wrapped_auk_json: &str,
+) -> Result<String, JsError> {
+    let auk = unlock_auk(passphrase, old_secret_key_b64, wrapped_auk_json)?;
+    let new_sk = SecretKey::random();
+    let wrapped = wrap_with_passphrase(&auk, passphrase.as_bytes(), &new_sk, KdfProfile::Constrained);
+    Ok(serde_json::json!({
+        "secretKey": b64(new_sk.as_bytes()),
+        "wrappedAukPassphrase": serde_json::to_value(&wrapped).map_err(|e| JsError::new(&e.to_string()))?,
+    })
+    .to_string())
+}
+
+/// Regenerate the recovery code. Mints a fresh high-entropy code and wraps
+/// the AUK under its derived KEK; the old code stops working once the server
+/// replaces the stored recovery wrap.
+#[wasm_bindgen]
+pub fn wasm_rotate_recovery_code(
+    passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+) -> Result<String, JsError> {
+    use rand::RngCore;
+    let auk = unlock_auk(passphrase, secret_key_b64, wrapped_auk_json)?;
+    let mut rb = [0u8; 20];
+    rand::rngs::OsRng.fill_bytes(&mut rb);
+    let recovery_code = b64(&rb);
+    let recovery_kek = hkdf_sha256(recovery_code.as_bytes(), b"", b"pock/recovery/v1");
+    let wrapped = wrap_with_kek(&auk, &recovery_kek, "recovery");
+    Ok(serde_json::json!({
+        "recoveryCode": recovery_code,
+        "wrappedAukRecovery": serde_json::to_value(&wrapped).map_err(|e| JsError::new(&e.to_string()))?,
+    })
+    .to_string())
+}
+
+/// Deep rotation: mint a brand-new identity keypair wrapped under the same
+/// AUK. The caller must re-encrypt every item to the new public identity and
+/// re-register pubkeys server-side; until then old blobs still need the old
+/// secret (also returned).
+#[wasm_bindgen]
+pub fn wasm_rotate_identity(
+    passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+    old_wrapped_identity_b64: &str,
+) -> Result<String, JsError> {
+    let auk = unlock_auk(passphrase, secret_key_b64, wrapped_auk_json)?;
+    let old = unwrap_identity(&auk, old_wrapped_identity_b64).map_err(|e| JsError::new(&e.to_string()))?;
+    let fresh = Identity::generate();
+    let pubid = fresh.public();
+    Ok(serde_json::json!({
+        "signPubkey": b64(pubid.sign.as_bytes()),
+        "kemPubkey": b64(&pubid.kem.as_bytes()),
+        "wrappedIdentity": wrap_identity(&auk, &fresh),
+        "identitySecretB64": b64(&fresh.to_secret_bytes()),
+        "oldIdentitySecretB64": b64(&old.to_secret_bytes()),
+        "publicBlob": serde_json::to_value(pubid.to_blob()).map_err(|e| JsError::new(&e.to_string()))?,
+    })
+    .to_string())
+}
+
+/// Encrypted binary vault backup (.pockvault). Standalone: only the backup
+/// passphrase is needed to restore.
+#[wasm_bindgen]
+pub fn wasm_export_backup(json: &str, passphrase: &str) -> Result<Vec<u8>, JsError> {
+    crate::backup::export_backup(json.as_bytes(), passphrase.as_bytes())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn wasm_import_backup(data: &[u8], passphrase: &str) -> Result<String, JsError> {
+    let pt = crate::backup::import_backup(data, passphrase.as_bytes())
+        .map_err(|_| JsError::new("wrong passphrase or corrupted backup"))?;
+    String::from_utf8(pt).map_err(|e| JsError::new(&e.to_string()))
 }
 
 const PRF_INFO: &[u8] = b"pock/webauthn-prf/v1";

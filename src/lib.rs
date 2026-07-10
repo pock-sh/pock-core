@@ -8,6 +8,7 @@ pub mod identity;
 pub mod envelope;
 pub mod item;
 pub mod auk;
+pub mod backup;
 pub mod share;
 
 #[cfg(feature = "wasm")]
