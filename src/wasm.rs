@@ -1,8 +1,10 @@
 #![cfg(feature = "wasm")]
+use crate::aead::{open_aad, seal_aad, AeadKey};
 use crate::auk::{
     unwrap_identity, unwrap_with_kek, unwrap_with_passphrase, wrap_identity, wrap_with_kek,
     wrap_with_passphrase, Auk, SecretKey, WrappedAuk,
 };
+use crate::sign::SignPublic;
 use crate::identity::{Identity, PublicIdentity, PublicIdentityBlob};
 use crate::item::{decrypt_item, encrypt_item, EncryptedItem};
 use crate::kdf::{hkdf_sha256, KdfProfile};
@@ -162,6 +164,48 @@ pub fn wasm_reset_passphrase(
         "wrappedAukPassphrase": serde_json::to_value(&wrapped_pp).map_err(|e| JsError::new(&e.to_string()))?,
     })
     .to_string())
+}
+
+fn aead_key(key_b64: &str) -> Result<AeadKey, JsError> {
+    let kb = unb64(key_b64)?;
+    let arr: [u8; 32] = kb.as_slice().try_into().map_err(|_| JsError::new("bad symmetric key length"))?;
+    Ok(AeadKey::from_bytes(arr))
+}
+
+/// Random 32-byte XChaCha20-Poly1305 key, base64. Used as a chat channel key
+/// or a per-attachment blob key.
+#[wasm_bindgen]
+pub fn wasm_generate_symmetric_key() -> String {
+    b64(AeadKey::random().as_bytes())
+}
+
+/// Symmetric AEAD seal: returns nonce||ciphertext. `aad` binds context (e.g.
+/// `channel_id|key_version|sender_id`) into the tag without being stored.
+#[wasm_bindgen]
+pub fn wasm_seal_symmetric(key_b64: &str, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, JsError> {
+    Ok(seal_aad(&aead_key(key_b64)?, plaintext, aad))
+}
+
+#[wasm_bindgen]
+pub fn wasm_open_symmetric(key_b64: &str, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, JsError> {
+    open_aad(&aead_key(key_b64)?, blob, aad).map_err(|_| JsError::new("decrypt failed (wrong key or tampered)"))
+}
+
+/// Ed25519 signature over `msg` with the identity's signing key, base64.
+#[wasm_bindgen]
+pub fn wasm_sign_message(identity_secret_b64: &str, msg: &[u8]) -> Result<String, JsError> {
+    let id = Identity::from_secret_bytes(&unb64(identity_secret_b64)?)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(b64(&id.sign.sign(msg)))
+}
+
+#[wasm_bindgen]
+pub fn wasm_verify_message(sign_pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> Result<bool, JsError> {
+    let pk_bytes = unb64(sign_pubkey_b64)?;
+    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| JsError::new("bad sign pubkey length"))?;
+    let sig_bytes = unb64(sig_b64)?;
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| JsError::new("bad signature length"))?;
+    Ok(SignPublic::from_bytes(pk_arr).verify(msg, &sig_arr).is_ok())
 }
 
 const PRF_INFO: &[u8] = b"pock/webauthn-prf/v1";

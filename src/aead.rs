@@ -20,21 +20,36 @@ impl AeadKey {
 }
 
 pub fn seal(key: &AeadKey, plaintext: &[u8]) -> Vec<u8> {
+    seal_aad(key, plaintext, b"")
+}
+
+pub fn open(key: &AeadKey, blob: &[u8]) -> Result<Vec<u8>> {
+    open_aad(key, blob, b"")
+}
+
+/// Like [`seal`] but binds associated data into the authentication tag, so a
+/// ciphertext cannot be replayed under a different context (e.g. another
+/// channel or sender).
+pub fn seal_aad(key: &AeadKey, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::aead::Payload;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher.encrypt(&nonce, plaintext).expect("XChaCha encrypt never fails");
+    let ct = cipher
+        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .expect("XChaCha encrypt never fails");
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(nonce.as_slice());
     out.extend_from_slice(&ct);
     out
 }
 
-pub fn open(key: &AeadKey, blob: &[u8]) -> Result<Vec<u8>> {
+pub fn open_aad(key: &AeadKey, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::Payload;
     if blob.len() < NONCE_LEN { return Err(CoreError::Decode("aead blob too short".into())); }
     let (nonce_bytes, ct) = blob.split_at(NONCE_LEN);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce = XNonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ct).map_err(|_| CoreError::WrongKey)
+    cipher.decrypt(nonce, Payload { msg: ct, aad }).map_err(|_| CoreError::WrongKey)
 }
 
 #[cfg(test)]
@@ -61,6 +76,22 @@ mod tests {
     fn wrong_key_fails() {
         let blob = seal(&AeadKey::random(), b"x");
         assert!(matches!(open(&AeadKey::random(), &blob), Err(CoreError::WrongKey)));
+    }
+
+    #[test]
+    fn aad_mismatch_rejected() {
+        let key = AeadKey::random();
+        let blob = seal_aad(&key, b"msg", b"channel-a|v1");
+        assert_eq!(open_aad(&key, &blob, b"channel-a|v1").unwrap(), b"msg");
+        assert!(matches!(open_aad(&key, &blob, b"channel-b|v1"), Err(CoreError::WrongKey)));
+        assert!(matches!(open_aad(&key, &blob, b""), Err(CoreError::WrongKey)));
+    }
+
+    #[test]
+    fn empty_aad_is_plain_seal() {
+        let key = AeadKey::random();
+        let blob = seal(&key, b"msg");
+        assert_eq!(open_aad(&key, &blob, b"").unwrap(), b"msg");
     }
 
     #[test]
