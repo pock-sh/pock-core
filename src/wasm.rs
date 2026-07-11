@@ -421,3 +421,38 @@ pub fn wasm_amk_sign(
     let auk = unlock_auk(passphrase, secret_key_b64, wrapped_auk_json)?;
     amk_sign_from_auk(&auk, wrapped_amk, msg)
 }
+
+fn auk_from_prf(prf_secret_b64: &str, wrapped_auk_prf_json: &str) -> Result<Auk, JsError> {
+    let wrapped_prf: WrappedAuk =
+        serde_json::from_str(wrapped_auk_prf_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let kek = prf_kek(prf_secret_b64)?;
+    unwrap_with_kek(&wrapped_prf, &kek).map_err(|_| JsError::new("touch id unlock failed"))
+}
+
+/// Create-or-load the AMK sealed under the AUK (PRF / passkey path).
+#[wasm_bindgen]
+pub fn wasm_amk_ensure_prf(
+    prf_secret_b64: &str,
+    wrapped_auk_prf_json: &str,
+    existing_wrapped_amk: &str,
+) -> Result<String, JsError> {
+    let auk = auk_from_prf(prf_secret_b64, wrapped_auk_prf_json)?;
+    let (amk_secret, wrapped_amk) = amk_ensure_from_auk(&auk, existing_wrapped_amk)?;
+    Ok(serde_json::json!({
+        "amkPub": b64(amk_secret.public().as_bytes()),
+        "wrappedAmk": wrapped_amk,
+    })
+    .to_string())
+}
+
+/// Sign `msg` with the AMK (unsealed under the AUK, PRF / passkey path).
+#[wasm_bindgen]
+pub fn wasm_amk_sign_prf(
+    prf_secret_b64: &str,
+    wrapped_auk_prf_json: &str,
+    wrapped_amk: &str,
+    msg: &[u8],
+) -> Result<String, JsError> {
+    let auk = auk_from_prf(prf_secret_b64, wrapped_auk_prf_json)?;
+    amk_sign_from_auk(&auk, wrapped_amk, msg)
+}

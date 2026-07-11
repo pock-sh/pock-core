@@ -1,6 +1,6 @@
 #![cfg(all(target_arch = "wasm32", feature = "wasm"))]
 use wasm_bindgen_test::*;
-use pock_core::wasm::{wasm_amk_ensure, wasm_amk_sign, wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_enroll_prf, wasm_generate_identity, wasm_unlock_prf, wasm_unlock_vault, wasm_verify_message};
+use pock_core::wasm::{wasm_amk_ensure, wasm_amk_ensure_prf, wasm_amk_sign, wasm_amk_sign_prf, wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_enroll_prf, wasm_generate_identity, wasm_unlock_prf, wasm_unlock_vault, wasm_verify_message};
 
 #[wasm_bindgen_test]
 fn share_roundtrip_both_ciphers() {
@@ -108,4 +108,23 @@ fn amk_sign_rejects_wrong_passphrase() {
         serde_json::from_str(&wasm_amk_ensure("right", sk, &wpp, "").unwrap()).unwrap();
     let wrapped_amk = out["wrappedAmk"].as_str().unwrap().to_string();
     assert!(wasm_amk_sign("wrong", sk, &wpp, &wrapped_amk, b"x").is_err());
+}
+
+#[wasm_bindgen_test]
+fn amk_prf_path_signs_and_verifies() {
+    // Build a vault, enroll a PRF passkey wrap, then drive the AMK PRF path.
+    let created = wasm_create_vault("pw").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+    let sk = v["secretKey"].as_str().unwrap();
+    let wpp = serde_json::to_string(&v["wrappedAukPassphrase"]).unwrap();
+    let prf_secret = "A".repeat(43); // 32 zero bytes, stand-in for authenticator PRF output
+    let wrapped_prf = wasm_enroll_prf("pw", sk, &wpp, &prf_secret).unwrap();
+
+    let out: serde_json::Value =
+        serde_json::from_str(&wasm_amk_ensure_prf(&prf_secret, &wrapped_prf, "").unwrap()).unwrap();
+    let amk_pub = out["amkPub"].as_str().unwrap().to_string();
+    let wrapped_amk = out["wrappedAmk"].as_str().unwrap().to_string();
+
+    let sig = wasm_amk_sign_prf(&prf_secret, &wrapped_prf, &wrapped_amk, b"cert").unwrap();
+    assert!(wasm_verify_message(&amk_pub, b"cert", &sig).unwrap());
 }
