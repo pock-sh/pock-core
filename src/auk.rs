@@ -102,6 +102,18 @@ pub fn unwrap_identity(auk: &Auk, wrapped: &str) -> Result<Identity> {
     Identity::from_secret_bytes(&secret)
 }
 
+/// Seal an arbitrary secret (e.g. the AMK signing key) under the AUK. Returns
+/// base64(nonce||ciphertext). Mirrors `wrap_identity` — the AUK's inner AEAD key
+/// encrypts the plaintext directly.
+pub fn wrap_secret(auk: &Auk, plaintext: &[u8]) -> String {
+    b64(&aead_seal(auk.key(), plaintext))
+}
+
+/// Inverse of `wrap_secret`.
+pub fn unwrap_secret(auk: &Auk, b64s: &str) -> Result<Vec<u8>> {
+    aead_open(auk.key(), &unb64(b64s)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +161,23 @@ mod tests {
         let wrapped = wrap_identity(&auk, &id);
         let restored = unwrap_identity(&auk, &wrapped).unwrap();
         assert_eq!(restored.public().kem.as_bytes(), id.public().kem.as_bytes());
+    }
+
+    #[test]
+    fn wrap_secret_roundtrips_under_auk() {
+        let auk = Auk::generate();
+        let secret = b"amk-secret-bytes-0123456789";
+        let sealed = wrap_secret(&auk, secret);
+        let opened = unwrap_secret(&auk, &sealed).unwrap();
+        assert_eq!(opened, secret);
+    }
+
+    #[test]
+    fn unwrap_secret_fails_under_wrong_auk() {
+        let a = Auk::generate();
+        let b = Auk::generate();
+        let sealed = wrap_secret(&a, b"x");
+        assert!(unwrap_secret(&b, &sealed).is_err());
     }
 
     #[test]
