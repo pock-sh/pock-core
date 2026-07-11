@@ -1,6 +1,6 @@
 #![cfg(all(target_arch = "wasm32", feature = "wasm"))]
 use wasm_bindgen_test::*;
-use pock_core::wasm::{wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_enroll_prf, wasm_generate_identity, wasm_unlock_prf, wasm_unlock_vault};
+use pock_core::wasm::{wasm_amk_ensure, wasm_amk_sign, wasm_create_vault, wasm_decrypt_item, wasm_decrypt_share, wasm_encrypt_item, wasm_encrypt_share, wasm_enroll_prf, wasm_generate_identity, wasm_unlock_prf, wasm_unlock_vault, wasm_verify_message};
 
 #[wasm_bindgen_test]
 fn share_roundtrip_both_ciphers() {
@@ -71,4 +71,41 @@ fn enroll_then_unlock_prf() {
     let unlocked = wasm_unlock_prf(&prf_secret, &wrapped_prf, wid).unwrap();
     let u: serde_json::Value = serde_json::from_str(&unlocked).unwrap();
     assert_eq!(u["identitySecretB64"].as_str().unwrap(), v["identitySecretB64"].as_str().unwrap());
+}
+
+#[wasm_bindgen_test]
+fn amk_ensure_is_idempotent_and_sign_verifies() {
+    // Build a real vault: AUK wrapped under a passphrase + secret key.
+    let created = wasm_create_vault("correct horse").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+    let sk = v["secretKey"].as_str().unwrap();
+    let wpp = serde_json::to_string(&v["wrappedAukPassphrase"]).unwrap();
+
+    // First ensure mints the AMK.
+    let out1: serde_json::Value =
+        serde_json::from_str(&wasm_amk_ensure("correct horse", sk, &wpp, "").unwrap()).unwrap();
+    let amk_pub = out1["amkPub"].as_str().unwrap().to_string();
+    let wrapped_amk = out1["wrappedAmk"].as_str().unwrap().to_string();
+
+    // Second ensure with the existing blob returns the SAME public key (idempotent).
+    let out2: serde_json::Value =
+        serde_json::from_str(&wasm_amk_ensure("correct horse", sk, &wpp, &wrapped_amk).unwrap()).unwrap();
+    assert_eq!(out2["amkPub"].as_str().unwrap(), amk_pub);
+
+    // Sign with the AMK and verify against amkPub via the existing verify fn.
+    let msg = b"succession-cert-bytes";
+    let sig = wasm_amk_sign("correct horse", sk, &wpp, &wrapped_amk, msg).unwrap();
+    assert!(wasm_verify_message(&amk_pub, msg, &sig).unwrap());
+}
+
+#[wasm_bindgen_test]
+fn amk_sign_rejects_wrong_passphrase() {
+    let created = wasm_create_vault("right").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+    let sk = v["secretKey"].as_str().unwrap();
+    let wpp = serde_json::to_string(&v["wrappedAukPassphrase"]).unwrap();
+    let out: serde_json::Value =
+        serde_json::from_str(&wasm_amk_ensure("right", sk, &wpp, "").unwrap()).unwrap();
+    let wrapped_amk = out["wrappedAmk"].as_str().unwrap().to_string();
+    assert!(wasm_amk_sign("wrong", sk, &wpp, &wrapped_amk, b"x").is_err());
 }

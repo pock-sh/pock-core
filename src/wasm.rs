@@ -1,10 +1,10 @@
 #![cfg(feature = "wasm")]
 use crate::aead::{open_aad, seal_aad, AeadKey};
 use crate::auk::{
-    unwrap_identity, unwrap_with_kek, unwrap_with_passphrase, wrap_identity, wrap_with_kek,
-    wrap_with_passphrase, Auk, SecretKey, WrappedAuk,
+    unwrap_identity, unwrap_secret, unwrap_with_kek, unwrap_with_passphrase, wrap_identity,
+    wrap_secret, wrap_with_kek, wrap_with_passphrase, Auk, SecretKey, WrappedAuk,
 };
-use crate::sign::SignPublic;
+use crate::sign::{SignPublic, SignSecret};
 use crate::identity::{Identity, PublicIdentity, PublicIdentityBlob};
 use crate::item::{decrypt_item, encrypt_item, EncryptedItem};
 use crate::kdf::{hkdf_sha256, KdfProfile};
@@ -358,4 +358,66 @@ pub fn wasm_unlock_prf(
     let auk = unwrap_with_kek(&wrapped_prf, &kek).map_err(|_| JsError::new("touch id unlock failed"))?;
     let identity = unwrap_identity(&auk, wrapped_identity_b64).map_err(|e| JsError::new(&e.to_string()))?;
     Ok(serde_json::json!({ "identitySecretB64": b64(&identity.to_secret_bytes()) }).to_string())
+}
+
+// ---- Account Master Key (AMK) -------------------------------------------------
+//
+// The AMK is a random Ed25519 key sealed under the AUK — the passphrase/passkey-
+// gated root of trust. The AUK is derived inside WASM and never crosses the
+// boundary; AMK functions take unlock inputs and return only the AMK public key +
+// the AUK-sealed `wrappedAmk` blob, or a signature.
+
+/// Given an unsealed AUK, create-or-load the AMK. `existing_wrapped_amk` empty →
+/// mint a fresh Ed25519 key and seal it; non-empty → load it (idempotent).
+/// Returns `(SignSecret, wrappedAmk)`.
+fn amk_ensure_from_auk(auk: &Auk, existing_wrapped_amk: &str) -> Result<(SignSecret, String), JsError> {
+    if existing_wrapped_amk.is_empty() {
+        let s = SignSecret::random();
+        let wrapped = wrap_secret(auk, &s.to_bytes());
+        Ok((s, wrapped))
+    } else {
+        let bytes = unwrap_secret(auk, existing_wrapped_amk).map_err(|e| JsError::new(&e.to_string()))?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| JsError::new("bad amk length"))?;
+        Ok((SignSecret::from_bytes(&arr).map_err(|e| JsError::new(&e.to_string()))?, existing_wrapped_amk.to_string()))
+    }
+}
+
+/// Unseal the AMK from the AUK and Ed25519-sign `msg`. Returns base64 signature.
+fn amk_sign_from_auk(auk: &Auk, wrapped_amk: &str, msg: &[u8]) -> Result<String, JsError> {
+    let bytes = unwrap_secret(auk, wrapped_amk).map_err(|e| JsError::new(&e.to_string()))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| JsError::new("bad amk length"))?;
+    let s = SignSecret::from_bytes(&arr).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(b64(&s.sign(msg)))
+}
+
+/// Create-or-load the Account Master Key (Ed25519) sealed under the AUK
+/// (passphrase path). Returns JSON `{ "amkPub": b64, "wrappedAmk": b64 }`.
+#[wasm_bindgen]
+pub fn wasm_amk_ensure(
+    passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+    existing_wrapped_amk: &str,
+) -> Result<String, JsError> {
+    let auk = unlock_auk(passphrase, secret_key_b64, wrapped_auk_json)?;
+    let (amk_secret, wrapped_amk) = amk_ensure_from_auk(&auk, existing_wrapped_amk)?;
+    Ok(serde_json::json!({
+        "amkPub": b64(amk_secret.public().as_bytes()),
+        "wrappedAmk": wrapped_amk,
+    })
+    .to_string())
+}
+
+/// Sign `msg` with the AMK (unsealed under the AUK, passphrase path). Returns
+/// base64 Ed25519 signature.
+#[wasm_bindgen]
+pub fn wasm_amk_sign(
+    passphrase: &str,
+    secret_key_b64: &str,
+    wrapped_auk_json: &str,
+    wrapped_amk: &str,
+    msg: &[u8],
+) -> Result<String, JsError> {
+    let auk = unlock_auk(passphrase, secret_key_b64, wrapped_auk_json)?;
+    amk_sign_from_auk(&auk, wrapped_amk, msg)
 }
