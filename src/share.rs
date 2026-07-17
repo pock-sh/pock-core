@@ -22,6 +22,11 @@ pub struct Bundle {
     pub files: Vec<EnvFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    // Optional user-supplied label for the whole share. Must be declared here or
+    // serde drops it on the round-trip through wasm_encrypt_share, silently
+    // discarding the name. Missing in older bundles, which deserialize to None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -173,6 +178,7 @@ mod tests {
             v: 1,
             files: vec![EnvFile { name: ".env".into(), content: "API_KEY=secret123\n".into() }],
             note: Some("hi".into()),
+            name: Some("Staging credentials".into()),
         }
     }
 
@@ -184,6 +190,34 @@ mod tests {
         assert_eq!(&env[0..4], b"PKEV");
         assert_eq!(env[4], 2);
         assert_eq!(env[5], 1);
+    }
+
+    // The wasm entry points hand bundles across a JSON string boundary, where an
+    // undeclared field would be dropped silently rather than failing to compile.
+    #[test]
+    fn name_survives_json_roundtrip() {
+        let json = serde_json::to_string(&sample()).unwrap();
+        assert!(json.contains("Staging credentials"));
+        let back: Bundle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name.as_deref(), Some("Staging credentials"));
+    }
+
+    // Bundles created before `name` existed must still decrypt, with name = None.
+    #[test]
+    fn bundle_without_name_deserializes() {
+        let legacy = r#"{"v":1,"files":[{"name":".env","content":"A=1\n"}]}"#;
+        let b: Bundle = serde_json::from_str(legacy).unwrap();
+        assert_eq!(b.name, None);
+        assert_eq!(b.files.len(), 1);
+        // Absent rather than null, so legacy readers see the shape they expect.
+        assert!(!serde_json::to_string(&b).unwrap().contains("name\":null"));
+    }
+
+    #[test]
+    fn name_survives_encrypt_decrypt() {
+        let (env, blob) = encrypt_share(&sample(), ShareCipher::Xwing).unwrap();
+        let out = decrypt_share(&env, &blob).unwrap();
+        assert_eq!(out.name.as_deref(), Some("Staging credentials"));
     }
 
     #[test]
@@ -221,6 +255,7 @@ mod tests {
                 EnvFile { name: ".env.prod".into(), content: "B=2\n".into() },
             ],
             note: None,
+            name: None,
         };
         let (env, blob) = encrypt_share(&b, ShareCipher::Xwing).unwrap();
         assert!(blob.starts_with("pock-key:v2:xwing:"));
