@@ -45,8 +45,10 @@ produce byte-identical output.
 
 ```toml
 [dependencies]
-pock-core = "0.2"
+pock-core = { git = "https://github.com/pock-sh/pock-core", tag = "v0.2.0" }
 ```
+
+A crates.io release will follow; until then pin the git tag.
 
 **WebAssembly** — `scripts/pack-wasm.sh` builds the `wasm` feature with
 `wasm-pack` and packs `@pock-sh/pock-core`. Each release attaches the tarball

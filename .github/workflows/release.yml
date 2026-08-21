@@ -42,10 +42,24 @@ jobs:
         with:
           tool: wasm-pack
       - run: ./scripts/pack-wasm.sh
+      # The npm tarball ships as a plain release asset, so it needs the same
+      # published checksum the xcframework zip gets. `shasum` records the bare
+      # filename, which is what `shasum -c` alongside the download expects.
+      - name: Checksum the tarball
+        run: |
+          set -euo pipefail
+          TGZ=$(ls *.tgz)
+          shasum -a 256 "$TGZ" > "${TGZ}.sha256"
+          shasum -a 256 -c "${TGZ}.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: wasm
-          path: "*.tgz"
+          # Listed separately rather than as `*.tgz*` so a stray file can never
+          # ride along, and so the two jobs' `.sha256` names stay distinct when
+          # `merge-multiple` flattens both artifacts into `dist/`.
+          path: |
+            *.tgz
+            *.tgz.sha256
           if-no-files-found: error
 
   xcframework:
@@ -135,7 +149,12 @@ jobs:
       - name: Publish the release
         run: |
           set -euo pipefail
-          ASSETS=(dist/*.tgz dist/PockCoreFFI.xcframework.zip dist/PockCoreFFI.xcframework.zip.sha256)
+          ASSETS=(
+            dist/*.tgz
+            dist/*.tgz.sha256
+            dist/PockCoreFFI.xcframework.zip
+            dist/PockCoreFFI.xcframework.zip.sha256
+          )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --clobber "${ASSETS[@]}"
           else

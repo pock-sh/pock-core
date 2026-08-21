@@ -449,28 +449,99 @@ mod tests {
         }
     }
 
+    /// A fresh vault, parsed. Every credential-failure test below starts from a
+    /// real `create_vault` so the wrapped blobs it feeds back in are the ones
+    /// the crate actually produces.
+    fn new_vault(passphrase: &str) -> serde_json::Value {
+        serde_json::from_str(&create_vault(passphrase.into()).unwrap()).unwrap()
+    }
+
+    /// Asserts the error a real flow returned is the `WrongCredential`
+    /// category carrying exactly `expected`, and that `expected` is genuinely
+    /// one of the `WRONG_CREDENTIAL_MESSAGES` entries — so the assertion is
+    /// tied to the table rather than to a literal repeated in the test.
+    fn assert_wrong_credential(err: PockCoreError, expected: &str) {
+        assert!(
+            WRONG_CREDENTIAL_MESSAGES.contains(&expected),
+            "{expected:?} is not in WRONG_CREDENTIAL_MESSAGES"
+        );
+        match err {
+            PockCoreError::WrongCredential { ref message } => assert_eq!(message, expected),
+            other => panic!("expected WrongCredential({expected:?}), got {other:?}"),
+        }
+    }
+
     #[test]
     fn wrong_passphrase_maps_to_wrong_credential() {
-        let created = flows::create_vault("right passphrase").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&created).unwrap();
-        let secret_key = v["secretKey"].as_str().unwrap().to_string();
-        let wrapped_auk = v["wrappedAukPassphrase"].to_string();
-        let wrapped_identity = v["wrappedIdentity"].as_str().unwrap().to_string();
+        let v = new_vault("right passphrase");
 
         let err = unlock_vault(
             "wrong passphrase".into(),
-            secret_key,
-            wrapped_auk,
-            wrapped_identity,
+            v["secretKey"].as_str().unwrap().to_string(),
+            v["wrappedAukPassphrase"].to_string(),
+            v["wrappedIdentity"].as_str().unwrap().to_string(),
         )
         .unwrap_err();
 
-        match err {
-            PockCoreError::WrongCredential { ref message } => {
-                assert_eq!(message, "wrong passphrase or secret key");
-            }
-            other => panic!("expected WrongCredential, got {other:?}"),
-        }
+        assert_wrong_credential(err, "wrong passphrase or secret key");
+    }
+
+    #[test]
+    fn wrong_recovery_code_maps_to_wrong_credential() {
+        let v = new_vault("right passphrase");
+        let real_code = v["recoveryCode"].as_str().unwrap().to_string();
+        let wrong_code = format!("{real_code}-nope");
+
+        let err = unlock_recovery(
+            wrong_code,
+            v["wrappedAukRecovery"].to_string(),
+            v["wrappedIdentity"].as_str().unwrap().to_string(),
+        )
+        .unwrap_err();
+
+        assert_wrong_credential(err, "wrong recovery code");
+    }
+
+    #[test]
+    fn wrong_backup_passphrase_maps_to_wrong_credential() {
+        let blob = export_backup(r#"{"items":[]}"#.into(), "right passphrase".into()).unwrap();
+
+        let err = import_backup(blob, "wrong passphrase".into()).unwrap_err();
+
+        assert_wrong_credential(err, "wrong passphrase or corrupted backup");
+    }
+
+    #[test]
+    fn failed_prf_unlock_maps_to_wrong_credential() {
+        let v = new_vault("right passphrase");
+        let wrapped_prf = enroll_prf(
+            "right passphrase".into(),
+            v["secretKey"].as_str().unwrap().to_string(),
+            v["wrappedAukPassphrase"].to_string(),
+            generate_symmetric_key(),
+        )
+        .unwrap();
+
+        // A different authenticator (or a PRF evaluation against the wrong
+        // credential) yields a different secret, so the KEK does not unwrap.
+        let err = unlock_prf(
+            generate_symmetric_key(),
+            wrapped_prf,
+            v["wrappedIdentity"].as_str().unwrap().to_string(),
+        )
+        .unwrap_err();
+
+        assert_wrong_credential(err, "touch id unlock failed");
+    }
+
+    #[test]
+    fn wrong_symmetric_key_maps_to_wrong_credential() {
+        let blob =
+            seal_symmetric(generate_symmetric_key(), b"hello".to_vec(), b"aad".to_vec()).unwrap();
+
+        let err = open_symmetric(generate_symmetric_key(), blob, b"aad".to_vec()).unwrap_err();
+
+        assert_wrong_credential(err, "decrypt failed (wrong key or tampered)");
     }
 
     #[test]
@@ -502,15 +573,41 @@ mod tests {
         }
     }
 
-    /// The `WRONG_CREDENTIAL_MESSAGES` table must be matched exactly — no
-    /// substring sniffing. Every literal in it maps to `WrongCredential`.
+    /// The table must not grow an entry that no flow drives. Each literal here
+    /// is proved against a real flow's output by the test named beside it, so
+    /// the classification is checked end to end and not against itself. Adding
+    /// a message to `WRONG_CREDENTIAL_MESSAGES` without a flow test that emits
+    /// it fails here; so does a stale entry no flow produces any more.
     #[test]
-    fn every_wrong_credential_message_maps_to_wrong_credential() {
+    fn every_wrong_credential_message_is_driven_by_a_flow_test() {
+        let covered = [
+            // wrong_passphrase_maps_to_wrong_credential (unlock_vault)
+            "wrong passphrase or secret key",
+            // wrong_recovery_code_maps_to_wrong_credential (unlock_recovery)
+            "wrong recovery code",
+            // wrong_backup_passphrase_maps_to_wrong_credential (import_backup)
+            "wrong passphrase or corrupted backup",
+            // wrong_symmetric_key_maps_to_wrong_credential (open_symmetric)
+            "decrypt failed (wrong key or tampered)",
+            // failed_prf_unlock_maps_to_wrong_credential (unlock_prf)
+            "touch id unlock failed",
+        ];
         for msg in WRONG_CREDENTIAL_MESSAGES {
+            assert!(
+                covered.contains(msg),
+                "{msg:?} is in the table but no flow test drives it"
+            );
+            // Belt and braces: the table entry itself still has to classify.
             assert_eq!(
                 category(CoreError::Flow((*msg).to_string())),
                 "WrongCredential",
                 "flow message {msg:?}"
+            );
+        }
+        for msg in covered {
+            assert!(
+                WRONG_CREDENTIAL_MESSAGES.contains(&msg),
+                "{msg:?} is claimed as covered but is not in the table"
             );
         }
     }
