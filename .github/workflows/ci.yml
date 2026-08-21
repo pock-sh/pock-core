@@ -12,6 +12,10 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # `rustsec/audit-check` reports through the Checks API.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +29,7 @@ jobs:
       # so there is no `--all-features` pass: each feature is linted against the
       # target it actually ships to.
       - run: cargo clippy --features uniffi --all-targets -- -D warnings
-      - run: cargo clippy --features wasm --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --features wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
