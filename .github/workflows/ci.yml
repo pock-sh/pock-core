@@ -54,26 +54,30 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
-      - name: Select Xcode
+      # macos-15 ships Xcode_16.3.app, but without its iOS platform installed:
+      # under it every iOS Simulator destination is ineligible ("iOS 18.4 is
+      # not installed"). The image default is the one with the runtimes, so we
+      # stay on it and just record which version ran.
+      - name: Record the Xcode in use
         run: |
           ls /Applications | grep -i '^Xcode' || true
-          if [ -d /Applications/Xcode_16.3.app ]; then
-            sudo xcode-select -s /Applications/Xcode_16.3.app
-          fi
           xcodebuild -version
       - run: ./scripts/build-xcframework.sh
       - name: Run the XCTest suite on a simulator
         run: |
           set -o pipefail
-          AVAILABLE=$(xcrun simctl list devices available \
-            | sed -n 's/^ *\(iPhone[^(]*\) (.*/\1/p' | sed 's/ *$//')
-          printf 'available iPhones:\n%s\n' "$AVAILABLE"
-          DEVICE=$(printf '%s\n' "$AVAILABLE" | grep -x 'iPhone 16' \
-            || printf '%s\n' "$AVAILABLE" | head -1)
-          if [ -z "$DEVICE" ]; then
-            echo "no iPhone simulator available on this runner" >&2
-            exit 1
-          fi
-          echo "testing on: $DEVICE"
+          # Pick by UDID: several runtimes expose the same device *name*, so a
+          # name-based destination is ambiguous on a runner.
+          PICK=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          runtimes = json.load(sys.stdin)["devices"]
+          phones = [d for devs in runtimes.values() for d in devs
+                    if d.get("isAvailable") and d["name"].startswith("iPhone")]
+          if not phones:
+              sys.exit("no iPhone simulator available on this runner")
+          best = next((d for d in phones if d["name"] == "iPhone 16"), phones[0])
+          print(best["udid"], best["name"])
+          ')
+          echo "testing on: $PICK"
           xcodebuild test -scheme PockCore \
-            -destination "platform=iOS Simulator,name=$DEVICE" | tail -20
+            -destination "platform=iOS Simulator,id=${PICK%% *}" | tail -20

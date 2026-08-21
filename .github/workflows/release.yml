@@ -31,13 +31,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Select Xcode
-        run: |
-          ls /Applications | grep -i '^Xcode' || true
-          if [ -d /Applications/Xcode_16.3.app ]; then
-            sudo xcode-select -s /Applications/Xcode_16.3.app
-          fi
-          xcodebuild -version
+      # Same Xcode as ci.yml — the image default, so the released binary is the
+      # one CI actually exercised.
+      - name: Record the Xcode in use
+        run: xcodebuild -version
       - run: ./scripts/build-xcframework.sh
       # `-y` keeps the symlinks inside the framework intact; the checksum is the
       # plain sha256 of the zip, which is exactly what SwiftPM verifies.
