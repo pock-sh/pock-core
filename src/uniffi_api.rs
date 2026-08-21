@@ -21,21 +21,11 @@ use crate::error::CoreError;
 use crate::flows;
 use zeroize::Zeroizing;
 
-/// The exact [`CoreError::Flow`] messages that mean "the credential the user
-/// supplied was wrong" (as opposed to "the caller passed something malformed").
-///
-/// These are literal strings constructed in `crate::flows`; matching them
-/// exactly — rather than sniffing for substrings — keeps the classification
-/// deterministic and means a reworded flow message shows up as a test failure
-/// instead of silently changing category. Every other `Flow` message, including
-/// the two `FromUtf8Error` pass-throughs in `flows`, is `InvalidInput`.
-pub(crate) const WRONG_CREDENTIAL_MESSAGES: &[&str] = &[
-    "wrong passphrase or secret key",
-    "wrong recovery code",
-    "wrong passphrase or corrupted backup",
-    "decrypt failed (wrong key or tampered)",
-    "touch id unlock failed",
-];
+/// The credential-failure classification table. It lives in [`crate::error`] so
+/// `pock-client` and any other consumer classify against the same list instead
+/// of keeping a copy that drifts; it is re-exported here because this module's
+/// mapping is its primary user.
+pub use crate::error::WRONG_CREDENTIAL_MESSAGES;
 
 /// The error Swift sees. Variants are coarse *categories* so a caller can
 /// branch on "the user typed the wrong secret" versus "the caller passed
@@ -434,6 +424,126 @@ pub fn amk_sign_prf(
     .map_err(Into::into)
 }
 
+// ---------------------------------------------------------------------------
+// Chat message digest
+// ---------------------------------------------------------------------------
+
+/// `SHA-256(aad ‖ ct)` — the bytes a chat message signature covers.
+#[uniffi::export]
+pub fn message_digest(aad: Vec<u8>, ct: Vec<u8>) -> Vec<u8> {
+    flows::message_digest(&aad, &ct)
+}
+
+/// Create a vault with an explicit Argon2 profile ("native" | "constrained").
+#[uniffi::export]
+pub fn create_vault_profile(passphrase: String, profile_id: String) -> Result<String, PockCoreError> {
+    let passphrase = Zeroizing::new(passphrase);
+    flows::create_vault_profile(&passphrase, &profile_id).map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// `pns1.` namespace protection
+// ---------------------------------------------------------------------------
+//
+// The namespace key crosses this boundary as STANDARD base64 rather than as a
+// `Vec<u8>`, so no raw key bytes land in a Swift/Kotlin buffer the host might
+// retain or log. The base64 string is still secret material and is `Zeroizing`
+// here, as are the passphrase and the plaintext value.
+
+/// A fresh namespace key, standard base64.
+#[uniffi::export]
+pub fn ns_random_nk() -> String {
+    flows::ns_random_nk()
+}
+
+/// A fresh 16-byte PBKDF2 salt, standard base64.
+#[uniffi::export]
+pub fn ns_random_salt() -> String {
+    flows::ns_random_salt()
+}
+
+/// A fresh namespace recovery code (`"a1b2-c3d4-…"`).
+#[uniffi::export]
+pub fn ns_random_recovery_code() -> String {
+    flows::ns_random_recovery_code()
+}
+
+/// Wrap the namespace key under a namespace passphrase.
+#[uniffi::export]
+pub fn ns_wrap_nk(nk_b64: String, passphrase: String, salt_b64: String) -> Result<String, PockCoreError> {
+    let nk_b64 = Zeroizing::new(nk_b64);
+    let passphrase = Zeroizing::new(passphrase);
+    flows::ns_wrap_nk(&nk_b64, &passphrase, &salt_b64).map_err(Into::into)
+}
+
+/// Unwrap the namespace key, returned as standard base64.
+#[uniffi::export]
+pub fn ns_unwrap_nk(wrapped: String, passphrase: String, salt_b64: String) -> Result<String, PockCoreError> {
+    let passphrase = Zeroizing::new(passphrase);
+    flows::ns_unwrap_nk(&wrapped, &passphrase, &salt_b64).map_err(Into::into)
+}
+
+/// Encrypt one value under the namespace key; result carries the `pns1.` prefix.
+#[uniffi::export]
+pub fn ns_protect_value(nk_b64: String, value: String) -> Result<String, PockCoreError> {
+    let nk_b64 = Zeroizing::new(nk_b64);
+    let value = Zeroizing::new(value);
+    flows::ns_protect_value(&nk_b64, &value).map_err(Into::into)
+}
+
+/// Decrypt a `pns1.` value under the namespace key.
+#[uniffi::export]
+pub fn ns_unprotect_value(nk_b64: String, blob: String) -> Result<String, PockCoreError> {
+    let nk_b64 = Zeroizing::new(nk_b64);
+    flows::ns_unprotect_value(&nk_b64, &blob).map_err(Into::into)
+}
+
+/// Standard base64 of `SHA-256(nk)`, for the audit log.
+#[uniffi::export]
+pub fn ns_nk_hash(nk_b64: String) -> Result<String, PockCoreError> {
+    let nk_b64 = Zeroizing::new(nk_b64);
+    flows::ns_nk_hash(&nk_b64).map_err(Into::into)
+}
+
+/// Whether a stored value carries the `pns1.` prefix.
+#[uniffi::export]
+pub fn ns_is_protected(blob: String) -> bool {
+    flows::ns_is_protected(&blob)
+}
+
+// ---------------------------------------------------------------------------
+// Key-transparency canonical bytes
+// ---------------------------------------------------------------------------
+
+/// Canonical bytes of `{userId,kemPubkey,signPubkey,rot,principalSeq,ts}`.
+#[uniffi::export]
+pub fn cert_bytes(cert_json: String) -> Result<Vec<u8>, PockCoreError> {
+    flows::cert_bytes_json(&cert_json).map_err(Into::into)
+}
+
+/// Canonical bytes of `{userId,kemPubkey,signPubkey,ts}`.
+#[uniffi::export]
+pub fn leaf_bytes(leaf_json: String) -> Result<Vec<u8>, PockCoreError> {
+    flows::leaf_bytes_json(&leaf_json).map_err(Into::into)
+}
+
+/// Canonical bytes of `{logId,size,root,ts}`.
+#[uniffi::export]
+pub fn sth_message(sth_json: String) -> Result<Vec<u8>, PockCoreError> {
+    flows::sth_message_json(&sth_json).map_err(Into::into)
+}
+
+/// k-of-n verification of a succession certificate.
+#[uniffi::export]
+pub fn verify_cert(
+    cert_json: String,
+    sigs_json: String,
+    custodians_json: String,
+    threshold: u32,
+) -> Result<bool, PockCoreError> {
+    flows::verify_cert_json(&cert_json, &sigs_json, &custodians_json, threshold).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +594,74 @@ mod tests {
         .unwrap_err();
 
         assert_wrong_credential(err, "wrong passphrase or secret key");
+    }
+
+    /// Drives the 0.3.0 addition to the table through the real namespace flow,
+    /// so the entry is proved by a failure the crate actually produces.
+    #[test]
+    fn wrong_namespace_passphrase_maps_to_wrong_credential() {
+        let nk = ns_random_nk();
+        let salt = ns_random_salt();
+        let wrapped = ns_wrap_nk(nk, "right passphrase".into(), salt.clone()).unwrap();
+
+        let err = ns_unwrap_nk(wrapped, "wrong passphrase".into(), salt).unwrap_err();
+
+        assert_wrong_credential(err, "wrong namespace passphrase");
+    }
+
+    /// The namespace surface round-trips across the FFI wrappers, not just in
+    /// `flows` — the base64 hand-off is where a boundary bug would show up.
+    #[test]
+    fn the_namespace_ffi_wrappers_roundtrip() {
+        let nk = ns_random_nk();
+        let salt = ns_random_salt();
+        let wrapped = ns_wrap_nk(nk.clone(), "pw".into(), salt.clone()).unwrap();
+        assert_eq!(ns_unwrap_nk(wrapped, "pw".into(), salt).unwrap(), nk);
+
+        let blob = ns_protect_value(nk.clone(), "s3cret".into()).unwrap();
+        assert!(ns_is_protected(blob.clone()));
+        assert_eq!(ns_unprotect_value(nk.clone(), blob).unwrap(), "s3cret");
+        assert!(!ns_nk_hash(nk).unwrap().is_empty());
+        assert_eq!(ns_random_recovery_code().len(), 24);
+    }
+
+    /// `message_digest` and the key-log encoders are pure and infallible-ish;
+    /// pin their FFI shape so a rename shows up here.
+    #[test]
+    fn the_keylog_ffi_wrappers_produce_canonical_bytes() {
+        assert_eq!(message_digest(b"aad".to_vec(), b"ct".to_vec()).len(), 32);
+        let cert = r#"{"userId":"u","kemPubkey":"K","signPubkey":"S","rot":{"custodians":["A"],"threshold":1},"principalSeq":0,"ts":1}"#;
+        assert_eq!(
+            String::from_utf8(cert_bytes(cert.into()).unwrap()).unwrap(),
+            "pock-keycert-v1\nu\nK\nS\nA|1\n0\n1"
+        );
+        assert_eq!(
+            String::from_utf8(leaf_bytes(r#"{"userId":"u","kemPubkey":"K","signPubkey":"S","ts":7}"#.into()).unwrap()).unwrap(),
+            "pock-keylog-v1\nu\nK\nS\n7"
+        );
+        assert_eq!(
+            String::from_utf8(sth_message(r#"{"logId":"L","size":3,"root":"ab","ts":7}"#.into()).unwrap()).unwrap(),
+            "pock-sth-v1\nL\n3\nab\n7"
+        );
+        assert!(!verify_cert(cert.into(), "[]".into(), r#"["A"]"#.into(), 1).unwrap());
+    }
+
+    /// A vault minted with the native profile must unlock through the same FFI.
+    #[test]
+    fn create_vault_profile_native_unlocks_over_the_ffi() {
+        let v: serde_json::Value =
+            serde_json::from_str(&create_vault_profile("pw".into(), "native".into()).unwrap()).unwrap();
+        unlock_vault(
+            "pw".into(),
+            v["secretKey"].as_str().unwrap().to_string(),
+            v["wrappedAukPassphrase"].to_string(),
+            v["wrappedIdentity"].as_str().unwrap().to_string(),
+        )
+        .expect("native vault must unlock");
+        match create_vault_profile("pw".into(), "nope".into()).unwrap_err() {
+            PockCoreError::InvalidInput { .. } => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]
@@ -591,6 +769,8 @@ mod tests {
             "decrypt failed (wrong key or tampered)",
             // failed_prf_unlock_maps_to_wrong_credential (unlock_prf)
             "touch id unlock failed",
+            // wrong_namespace_passphrase_maps_to_wrong_credential (ns_unwrap_nk)
+            "wrong namespace passphrase",
         ];
         for msg in WRONG_CREDENTIAL_MESSAGES {
             assert!(
@@ -680,6 +860,10 @@ mod tests {
             ),
             (
                 CoreError::Flow("touch id unlock failed".into()),
+                "WrongCredential",
+            ),
+            (
+                CoreError::Flow("wrong namespace passphrase".into()),
                 "WrongCredential",
             ),
             (CoreError::Flow("unknown cipher id".into()), "InvalidInput"),

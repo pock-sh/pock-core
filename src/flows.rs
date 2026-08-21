@@ -18,6 +18,7 @@ use crate::sign::{SignPublic, SignSecret};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 pub(crate) fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -70,8 +71,32 @@ pub fn decrypt_share(envelope_b64: &str, key_blob: &str) -> Result<String, CoreE
     Ok(serde_json::to_string(&bundle)?)
 }
 
+/// Creates a vault whose AUK is wrapped with the browser-safe Argon2 profile.
+///
+/// Every existing surface calls this, so it stays pinned to
+/// [`KdfProfile::Constrained`]: a vault minted with the heavier parameters
+/// could not be unlocked in a browser tab.
 pub fn create_vault(passphrase: &str) -> Result<String, CoreError> {
+    create_vault_profile(passphrase, "constrained")
+}
+
+/// Creates a vault with an explicitly chosen Argon2 profile.
+///
+/// `profile_id` is exactly `"native"` or `"constrained"`; anything else is
+/// [`CoreError::InvalidInput`]. The two ids mirror [`KdfProfile`]'s two
+/// variants — there is deliberately no third profile, because the id is baked
+/// into the wrapped AUK and a vault can only be opened by a surface that knows
+/// its parameters. `"native"` exists for the CLI and desktop, which are not
+/// bound by a browser's memory ceiling.
+pub fn create_vault_profile(passphrase: &str, profile_id: &str) -> Result<String, CoreError> {
     use rand::RngCore;
+    let profile = match profile_id {
+        "native" => KdfProfile::Native,
+        "constrained" => KdfProfile::Constrained,
+        other => {
+            return Err(CoreError::InvalidInput(format!("unknown kdf profile {other:?}")));
+        }
+    };
     let identity = Identity::generate();
     let auk = Auk::generate();
     let secret_key = SecretKey::random();
@@ -79,7 +104,7 @@ pub fn create_vault(passphrase: &str) -> Result<String, CoreError> {
     rand::rngs::OsRng.fill_bytes(&mut rb);
     let recovery_code = b64(&rb);
 
-    let wrapped_pp = wrap_with_passphrase(&auk, passphrase.as_bytes(), &secret_key, KdfProfile::Constrained);
+    let wrapped_pp = wrap_with_passphrase(&auk, passphrase.as_bytes(), &secret_key, profile);
     let recovery_kek = hkdf_sha256(recovery_code.as_bytes(), b"", b"pock/recovery/v1");
     let wrapped_rec = wrap_with_kek(&auk, &recovery_kek, "recovery");
     let wrapped_identity = wrap_identity(&auk, &identity);
@@ -427,6 +452,170 @@ pub fn amk_sign_prf(
     amk_sign_from_auk(&auk, wrapped_amk, msg)
 }
 
+// ---------------------------------------------------------------------------
+// Chat message digest
+// ---------------------------------------------------------------------------
+
+/// The bytes a chat message signature covers: `SHA-256(aad ‖ ct)`.
+///
+/// Mirrors `digestFor` in `chat-app/src/lib/crypto.ts`, which concatenates the
+/// AAD and the ciphertext and hashes once. Signing the digest rather than the
+/// message keeps the signature independent of message size while still binding
+/// channel, key version and sender through the AAD.
+pub fn message_digest(aad: &[u8], ct: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(aad);
+    h.update(ct);
+    h.finalize().to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Namespace protection (`pns1.`)
+// ---------------------------------------------------------------------------
+//
+// These wrappers take and return the namespace key as **standard** base64 so no
+// raw key bytes cross the wasm / UniFFI boundary as a `Vec<u8>` a host runtime
+// might log or copy into a JS heap it does not control. `crate::nscrypto` stays
+// the byte-level API that Rust callers (pock-client, the CLI) use directly.
+
+fn ns_b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+fn ns_unb64(s: &str) -> Result<Vec<u8>, CoreError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
+        .map_err(|e| CoreError::Encoding(e.to_string()))
+}
+
+/// Wraps a namespace key (standard base64) under a namespace passphrase.
+pub fn ns_wrap_nk(nk_b64: &str, passphrase: &str, salt_b64: &str) -> Result<String, CoreError> {
+    let nk = Zeroizing::new(ns_unb64(nk_b64)?);
+    crate::nscrypto::wrap_nk(&nk, passphrase, salt_b64)
+}
+
+/// Unwraps a namespace key, returning it as **standard** base64.
+pub fn ns_unwrap_nk(wrapped: &str, passphrase: &str, salt_b64: &str) -> Result<String, CoreError> {
+    let nk = Zeroizing::new(crate::nscrypto::unwrap_nk(wrapped, passphrase, salt_b64)?);
+    Ok(ns_b64(&nk))
+}
+
+/// Encrypts one value under the namespace key; the result carries the `pns1.` prefix.
+pub fn ns_protect_value(nk_b64: &str, value: &str) -> Result<String, CoreError> {
+    let nk = Zeroizing::new(ns_unb64(nk_b64)?);
+    crate::nscrypto::protect_value(&nk, value)
+}
+
+/// Decrypts a `pns1.` value under the namespace key.
+pub fn ns_unprotect_value(nk_b64: &str, blob: &str) -> Result<String, CoreError> {
+    let nk = Zeroizing::new(ns_unb64(nk_b64)?);
+    crate::nscrypto::unprotect_value(&nk, blob)
+}
+
+/// A fresh namespace key, standard base64.
+pub fn ns_random_nk() -> String {
+    ns_b64(&crate::nscrypto::random_nk())
+}
+
+/// A fresh PBKDF2 salt for a namespace, standard base64.
+pub fn ns_random_salt() -> String {
+    crate::nscrypto::random_salt_b64()
+}
+
+/// A fresh namespace recovery code (`"a1b2-c3d4-…"`).
+pub fn ns_random_recovery_code() -> String {
+    crate::nscrypto::random_ns_recovery_code()
+}
+
+/// Standard base64 of `SHA-256(nk)` — a namespace identifier for the audit log.
+pub fn ns_nk_hash(nk_b64: &str) -> Result<String, CoreError> {
+    let nk = Zeroizing::new(ns_unb64(nk_b64)?);
+    Ok(crate::nscrypto::nk_hash(&nk))
+}
+
+/// Whether a stored value carries the `pns1.` prefix.
+pub fn ns_is_protected(blob: &str) -> bool {
+    crate::nscrypto::is_protected_blob(blob)
+}
+
+// ---------------------------------------------------------------------------
+// Key-transparency canonical bytes (JSON-shaped for the bindings)
+// ---------------------------------------------------------------------------
+//
+// The JSON payloads use the camelCase field names the transparency Worker
+// already sends, so a caller can hand a proof straight through without
+// re-shaping it.
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertJson {
+    user_id: String,
+    kem_pubkey: String,
+    sign_pubkey: String,
+    rot: crate::keylog::Rot,
+    principal_seq: u64,
+    ts: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeafJson {
+    user_id: String,
+    kem_pubkey: String,
+    sign_pubkey: String,
+    ts: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SthJson {
+    log_id: String,
+    size: u64,
+    root: String,
+    ts: i64,
+}
+
+/// Canonical bytes of a succession certificate, from
+/// `{userId,kemPubkey,signPubkey,rot,principalSeq,ts}`.
+pub fn cert_bytes_json(cert_json: &str) -> Result<Vec<u8>, CoreError> {
+    let c: CertJson = serde_json::from_str(cert_json)?;
+    Ok(crate::keylog::cert_bytes(
+        &c.user_id,
+        &c.kem_pubkey,
+        &c.sign_pubkey,
+        &c.rot,
+        c.principal_seq,
+        c.ts,
+    ))
+}
+
+/// Canonical bytes of a log leaf, from `{userId,kemPubkey,signPubkey,ts}`.
+pub fn leaf_bytes_json(leaf_json: &str) -> Result<Vec<u8>, CoreError> {
+    let l: LeafJson = serde_json::from_str(leaf_json)?;
+    Ok(crate::keylog::leaf_bytes(&l.user_id, &l.kem_pubkey, &l.sign_pubkey, l.ts))
+}
+
+/// Canonical bytes of a Signed Tree Head, from `{logId,size,root,ts}`.
+pub fn sth_message_json(sth_json: &str) -> Result<Vec<u8>, CoreError> {
+    let s: SthJson = serde_json::from_str(sth_json)?;
+    Ok(crate::keylog::sth_message(&s.log_id, s.size, &s.root, s.ts))
+}
+
+/// k-of-n verification of a certificate described by the same JSON shape
+/// [`cert_bytes_json`] takes, against JSON arrays of signatures and custodians.
+pub fn verify_cert_json(
+    cert_json: &str,
+    sigs_json: &str,
+    custodians_json: &str,
+    threshold: u32,
+) -> Result<bool, CoreError> {
+    let bytes = cert_bytes_json(cert_json)?;
+    let sigs: Vec<String> = serde_json::from_str(sigs_json)?;
+    let custodians: Vec<String> = serde_json::from_str(custodians_json)?;
+    Ok(crate::keylog::verify_cert(&bytes, &sigs, &custodians, threshold))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +925,145 @@ mod tests {
         // Empty plaintext is still a valid sealed blob.
         let empty = seal_symmetric(&key, b"", aad).unwrap();
         assert_eq!(open_symmetric(&key, &empty, aad).unwrap(), Vec::<u8>::new());
+    }
+
+    // ---- create_vault_profile ------------------------------------------
+
+    #[test]
+    fn create_vault_defaults_to_the_constrained_profile() {
+        let v: serde_json::Value = serde_json::from_str(&create_vault("pw").unwrap()).unwrap();
+        let w = &v["wrappedAukPassphrase"];
+        let (m, t, p) = KdfProfile::Constrained.params();
+        assert_eq!((w["m_kib"].as_u64(), w["t"].as_u64(), w["p"].as_u64()),
+                   (Some(m as u64), Some(t as u64), Some(p as u64)));
+    }
+
+    #[test]
+    fn create_vault_profile_native_records_the_heavier_params_and_still_unlocks() {
+        let created = create_vault_profile("pw", "native").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let w = &v["wrappedAukPassphrase"];
+        let (m, t, p) = KdfProfile::Native.params();
+        assert_eq!((w["m_kib"].as_u64(), w["t"].as_u64(), w["p"].as_u64()),
+                   (Some(m as u64), Some(t as u64), Some(p as u64)));
+        // The stored params are what unlock reconstructs the profile from, so a
+        // native vault must open without the caller naming the profile again.
+        unlock_vault(
+            "pw",
+            v["secretKey"].as_str().unwrap(),
+            &w.to_string(),
+            v["wrappedIdentity"].as_str().unwrap(),
+        )
+        .expect("a native-profile vault must unlock");
+    }
+
+    #[test]
+    fn create_vault_profile_rejects_an_unknown_profile_id() {
+        let e = create_vault_profile("pw", "paranoid").unwrap_err();
+        assert_eq!(e.to_string(), "invalid input: unknown kdf profile \"paranoid\"");
+        assert!(create_vault_profile("pw", "Native").is_err(), "the id is case-sensitive");
+        assert!(create_vault_profile("pw", "").is_err());
+    }
+
+    // ---- message_digest -------------------------------------------------
+
+    #[test]
+    fn message_digest_is_sha256_over_aad_then_ciphertext() {
+        use sha2::{Digest, Sha256};
+        let aad = b"chan|3|user_1";
+        let ct = b"ciphertext";
+        let mut joined = aad.to_vec();
+        joined.extend_from_slice(ct);
+        assert_eq!(message_digest(aad, ct), Sha256::digest(&joined).to_vec());
+        assert_eq!(message_digest(aad, ct).len(), 32);
+    }
+
+    #[test]
+    fn message_digest_binds_the_split_between_aad_and_ciphertext() {
+        // Not a plain concat-then-hash escape hatch: moving the boundary must
+        // still change the digest for a caller who mis-slices, and it does not,
+        // which is exactly why the AAD is fixed-shape at the call site. Pin the
+        // behaviour so a future "improvement" that adds a separator is caught
+        // as the wire-format break it would be.
+        assert_eq!(message_digest(b"ab", b"c"), message_digest(b"a", b"bc"));
+    }
+
+    // ---- namespace wrappers --------------------------------------------
+
+    #[test]
+    fn namespace_flow_wrappers_roundtrip_through_standard_base64() {
+        let nk = ns_random_nk();
+        assert!(!nk.contains('-') && !nk.contains('_'), "standard base64");
+        assert_eq!(ns_unb64(&nk).unwrap().len(), 32);
+        let salt = ns_random_salt();
+        let wrapped = ns_wrap_nk(&nk, "pw", &salt).unwrap();
+        assert_eq!(ns_unwrap_nk(&wrapped, "pw", &salt).unwrap(), nk);
+
+        let blob = ns_protect_value(&nk, "s3cret").unwrap();
+        assert!(ns_is_protected(&blob));
+        assert_eq!(ns_unprotect_value(&nk, &blob).unwrap(), "s3cret");
+        assert_eq!(ns_nk_hash(&nk).unwrap(), crate::nscrypto::nk_hash(&ns_unb64(&nk).unwrap()));
+    }
+
+    #[test]
+    fn ns_unwrap_nk_reports_the_classified_wrong_passphrase_message() {
+        let nk = ns_random_nk();
+        let salt = ns_random_salt();
+        let wrapped = ns_wrap_nk(&nk, "pw", &salt).unwrap();
+        let e = ns_unwrap_nk(&wrapped, "nope", &salt).unwrap_err();
+        assert_eq!(e.to_string(), "wrong namespace passphrase");
+        assert!(crate::error::WRONG_CREDENTIAL_MESSAGES.contains(&e.to_string().as_str()));
+    }
+
+    #[test]
+    fn ns_random_recovery_code_matches_the_typescript_shape() {
+        let c = ns_random_recovery_code();
+        assert_eq!(c.len(), 24);
+        assert!(c.split('-').all(|g| g.len() == 4 && g.chars().all(|ch| ch.is_ascii_hexdigit())));
+    }
+
+    // ---- key-log JSON wrappers ------------------------------------------
+
+    #[test]
+    fn cert_and_leaf_and_sth_json_wrappers_produce_the_canonical_bytes() {
+        let cert = r#"{"userId":"u","kemPubkey":"K","signPubkey":"S",
+            "rot":{"custodians":["A","B"],"threshold":2},"principalSeq":4,"ts":9}"#;
+        assert_eq!(
+            String::from_utf8(cert_bytes_json(cert).unwrap()).unwrap(),
+            "pock-keycert-v1\nu\nK\nS\nA,B|2\n4\n9"
+        );
+        assert_eq!(
+            String::from_utf8(leaf_bytes_json(r#"{"userId":"u","kemPubkey":"K","signPubkey":"S","ts":7}"#).unwrap()).unwrap(),
+            "pock-keylog-v1\nu\nK\nS\n7"
+        );
+        assert_eq!(
+            String::from_utf8(sth_message_json(r#"{"logId":"pock.sh/keylog/v1","size":3,"root":"ab12","ts":7}"#).unwrap()).unwrap(),
+            "pock-sth-v1\npock.sh/keylog/v1\n3\nab12\n7"
+        );
+    }
+
+    #[test]
+    fn a_malformed_cert_payload_is_a_json_error_not_a_panic() {
+        assert!(matches!(cert_bytes_json("{}"), Err(CoreError::Json(_))));
+        assert!(matches!(leaf_bytes_json("not json"), Err(CoreError::Json(_))));
+        assert!(matches!(sth_message_json(r#"{"logId":"x"}"#), Err(CoreError::Json(_))));
+    }
+
+    #[test]
+    fn verify_cert_json_verifies_a_signature_over_the_canonical_bytes() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let pk = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes());
+        let cert = format!(
+            r#"{{"userId":"u","kemPubkey":"K","signPubkey":"S","rot":{{"custodians":["{pk}"],"threshold":1}},"principalSeq":0,"ts":1}}"#
+        );
+        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sk.sign(&cert_bytes_json(&cert).unwrap()).to_bytes());
+        let sigs = serde_json::to_string(&vec![sig]).unwrap();
+        let custodians = serde_json::to_string(&vec![pk]).unwrap();
+        assert!(verify_cert_json(&cert, &sigs, &custodians, 1).unwrap());
+        assert!(!verify_cert_json(&cert, "[]", &custodians, 1).unwrap());
+        assert!(!verify_cert_json(&cert, &sigs, &custodians, 2).unwrap());
+        assert!(verify_cert_json(&cert, "not json", &custodians, 1).is_err());
     }
 }

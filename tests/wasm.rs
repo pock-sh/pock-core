@@ -128,3 +128,81 @@ fn amk_prf_path_signs_and_verifies() {
     let sig = wasm_amk_sign_prf(&prf_secret, &wrapped_prf, &wrapped_amk, b"cert").unwrap();
     assert!(wasm_verify_message(&amk_pub, b"cert", &sig).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// 0.3.0 additions: `pns1.` namespace protection + key-log canonical bytes.
+// These run under wasm because the browser is the surface that has to agree
+// with the TS implementation they replace.
+// ---------------------------------------------------------------------------
+
+/// The vector `app/lib/namespace-crypto.ts` produced (all-sevens NK, "hunter2",
+/// an all-zero salt). If wasm ever diverges from native here, every namespace
+/// already stored by the browser stops opening.
+#[wasm_bindgen_test]
+fn wasm_unwraps_the_typescript_namespace_vector() {
+    use pock_core::wasm::{wasm_ns_nk_hash, wasm_ns_unprotect_value, wasm_ns_unwrap_nk};
+    const SALT: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+    const WRAPPED: &str =
+        "U9FZTfIDWBdLPBSB.rNjHLoGoborbEucrhf5F7H+j8fFPmC/p6ZQ8ZAxl+gVVP3U/j/s/uJf4IEeH3Blz";
+    const PROTECTED: &str = "pns1.3dPQK9tz4wEysh/3.Pm66ipYUxn++AKieo88QTuFaap4w4A==";
+
+    let nk = wasm_ns_unwrap_nk(WRAPPED, "hunter2", SALT).unwrap();
+    assert_eq!(nk, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=");
+    assert_eq!(wasm_ns_nk_hash(&nk).unwrap(), "S7Bvjk46dxXSAdVz0KpCN2LlXavWGiwCJ4+lbMbSlOA=");
+    assert_eq!(wasm_ns_unprotect_value(&nk, PROTECTED).unwrap(), "s3cret");
+    assert!(wasm_ns_unwrap_nk(WRAPPED, "nope", SALT).is_err());
+}
+
+#[wasm_bindgen_test]
+fn wasm_namespace_roundtrip() {
+    use pock_core::wasm::{
+        wasm_ns_is_protected, wasm_ns_protect_value, wasm_ns_random_nk, wasm_ns_random_salt,
+        wasm_ns_unprotect_value, wasm_ns_unwrap_nk, wasm_ns_wrap_nk,
+    };
+    let nk = wasm_ns_random_nk();
+    let salt = wasm_ns_random_salt();
+    let wrapped = wasm_ns_wrap_nk(&nk, "pw", &salt).unwrap();
+    assert_eq!(wasm_ns_unwrap_nk(&wrapped, "pw", &salt).unwrap(), nk);
+
+    let blob = wasm_ns_protect_value(&nk, "s3cret").unwrap();
+    assert!(wasm_ns_is_protected(&blob));
+    assert_eq!(wasm_ns_unprotect_value(&nk, &blob).unwrap(), "s3cret");
+}
+
+#[wasm_bindgen_test]
+fn wasm_keylog_bytes_and_message_digest() {
+    use pock_core::wasm::{wasm_cert_bytes, wasm_leaf_bytes, wasm_message_digest, wasm_sth_message};
+    let cert = r#"{"userId":"u","kemPubkey":"K","signPubkey":"S","rot":{"custodians":["A","B"],"threshold":2},"principalSeq":4,"ts":9}"#;
+    assert_eq!(
+        String::from_utf8(wasm_cert_bytes(cert).unwrap()).unwrap(),
+        "pock-keycert-v1\nu\nK\nS\nA,B|2\n4\n9"
+    );
+    assert_eq!(
+        String::from_utf8(wasm_leaf_bytes(r#"{"userId":"u","kemPubkey":"K","signPubkey":"S","ts":7}"#).unwrap()).unwrap(),
+        "pock-keylog-v1\nu\nK\nS\n7"
+    );
+    assert_eq!(
+        String::from_utf8(wasm_sth_message(r#"{"logId":"L","size":3,"root":"ab","ts":7}"#).unwrap()).unwrap(),
+        "pock-sth-v1\nL\n3\nab\n7"
+    );
+    assert_eq!(wasm_message_digest(b"aad", b"ct").len(), 32);
+}
+
+/// The @noble/curves-produced cert must verify through the wasm surface too —
+/// this is the pairing that `chat-app` relies on when it stops using its own
+/// TS verifier.
+#[wasm_bindgen_test]
+fn wasm_verify_cert_accepts_the_typescript_vector() {
+    use pock_core::wasm::wasm_verify_cert;
+    let cert = r#"{"userId":"user_2abc","kemPubkey":"KEMPUB","signPubkey":"SIGNPUB","rot":{"custodians":["_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg"],"threshold":1},"principalSeq":3,"ts":1710000000000}"#;
+    let sigs = r#"["6KV+EujQRswHAS0RV4+lKqtaOOcWqAVmLBTElnglBYyTP0bM+dZTYkR66h0jI6Zg54G9ImJIb99YNGFhBMxlBA=="]"#;
+    let custodians = r#"["_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg"]"#;
+    assert!(wasm_verify_cert(cert, sigs, custodians, 1).unwrap());
+    assert!(!wasm_verify_cert(cert, "[]", custodians, 1).unwrap());
+}
+
+#[wasm_bindgen_test]
+fn wasm_create_vault_profile_rejects_an_unknown_profile() {
+    use pock_core::wasm::wasm_create_vault_profile;
+    assert!(wasm_create_vault_profile("pw", "paranoid").is_err());
+}

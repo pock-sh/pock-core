@@ -45,20 +45,20 @@ produce byte-identical output.
 
 ```toml
 [dependencies]
-pock-core = { git = "https://github.com/pock-sh/pock-core", tag = "v0.2.0" }
+pock-core = { git = "https://github.com/pock-sh/pock-core", tag = "v0.3.0" }
 ```
 
 A crates.io release will follow; until then pin the git tag.
 
 **WebAssembly** — `scripts/pack-wasm.sh` builds the `wasm` feature with
 `wasm-pack` and packs `@pock-sh/pock-core`. Each release attaches the tarball
-(`pock-sh-pock-core-0.2.0.tgz`).
+(`pock-sh-pock-core-0.3.0.tgz`).
 
 **Swift** — the `uniffi` feature generates a Swift wrapper over an XCFramework,
 published as the `PockCore` package.
 
 ```swift
-.package(url: "https://github.com/pock-sh/pock-core", from: "0.2.0")
+.package(url: "https://github.com/pock-sh/pock-core", from: "0.3.0")
 ```
 
 ```swift
