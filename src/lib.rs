@@ -10,6 +10,7 @@ pub mod item;
 pub mod auk;
 pub mod backup;
 pub mod share;
+pub mod flows;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
