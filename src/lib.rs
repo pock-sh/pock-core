@@ -14,3 +14,9 @@ pub mod flows;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+// `uniffi` and `wasm` are orthogonal: never enable both in one build.
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+#[cfg(feature = "uniffi")]
+pub mod uniffi_api;

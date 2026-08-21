@@ -6,7 +6,8 @@ license = "MIT"
 description = "Pock zero-knowledge crypto core"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+name = "pock_core"
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 rand = "0.8"
@@ -24,10 +25,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 wasm-bindgen = { version = "0.2", optional = true }
+uniffi = { version = "0.32", optional = true }
 
 [features]
 default = []
 wasm = ["dep:wasm-bindgen", "getrandom/js"]
+# `uniffi` and `wasm` are orthogonal and must never be enabled together
+# (no `--all-features` on this crate).
+uniffi = ["dep:uniffi"]
+# Only needed to run the bindings generator binary; pulls in uniffi's CLI deps.
+uniffi-cli = ["uniffi", "uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
 
 # On wasm32 the dependency tree pulls a SECOND getrandom major version (0.4, via
 # x-wing -> rand_core 0.10). That line removed the `js` feature; it needs the

@@ -1,0 +1,7 @@
+# `module_name` names the generated Swift module (PockCore.swift); the low-level
+# C shim it imports is `ffi_module_name` (PockCoreFFI.h + PockCoreFFI.modulemap).
+# They must differ, or the Swift wrapper and the C module collide.
+[bindings.swift]
+module_name = "PockCore"
+ffi_module_name = "PockCoreFFI"
+generate_module_map = true
