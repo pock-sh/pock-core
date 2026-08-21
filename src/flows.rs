@@ -104,9 +104,7 @@ pub fn unlock_vault(
     wrapped_auk_json: &str,
     wrapped_identity_b64: &str,
 ) -> Result<String, CoreError> {
-    let sk_bytes = unb64(secret_key_b64)?;
-    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| CoreError::Flow("bad secret key".into()))?;
-    let secret_key = SecretKey::from_bytes(sk_arr);
+    let secret_key = parse_sk(secret_key_b64)?;
     let wrapped_auk: WrappedAuk = serde_json::from_str(wrapped_auk_json)?;
     let auk = unwrap_with_passphrase(&wrapped_auk, passphrase.as_bytes(), &secret_key)
         .map_err(|_| CoreError::Flow("wrong passphrase or secret key".into()))?;
@@ -142,9 +140,7 @@ pub fn reset_passphrase(
     let recovery_kek = hkdf_sha256(recovery_code.trim().as_bytes(), b"", b"pock/recovery/v1");
     let auk = unwrap_with_kek(&wrapped_rec, &recovery_kek)
         .map_err(|_| CoreError::Flow("wrong recovery code".into()))?;
-    let sk_bytes = unb64(secret_key_b64)?;
-    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| CoreError::Flow("bad secret key".into()))?;
-    let secret_key = SecretKey::from_bytes(sk_arr);
+    let secret_key = parse_sk(secret_key_b64)?;
     let wrapped_pp = wrap_with_passphrase(&auk, new_passphrase.as_bytes(), &secret_key, KdfProfile::Constrained);
     Ok(serde_json::json!({
         "wrappedAukPassphrase": serde_json::to_value(&wrapped_pp)?,
@@ -317,9 +313,7 @@ pub fn enroll_prf(
     wrapped_auk_json: &str,
     prf_secret_b64: &str,
 ) -> Result<String, CoreError> {
-    let sk_bytes = unb64(secret_key_b64)?;
-    let sk_arr: [u8; 16] = sk_bytes.as_slice().try_into().map_err(|_| CoreError::Flow("bad secret key".into()))?;
-    let secret_key = SecretKey::from_bytes(sk_arr);
+    let secret_key = parse_sk(secret_key_b64)?;
     let wrapped_auk: WrappedAuk = serde_json::from_str(wrapped_auk_json)?;
     let auk = unwrap_with_passphrase(&wrapped_auk, passphrase.as_bytes(), &secret_key)
         .map_err(|_| CoreError::Flow("wrong passphrase or secret key".into()))?;
@@ -512,5 +506,235 @@ mod tests {
 
         let sig = amk_sign_prf(&prf_secret, &wrapped_prf, &wrapped_amk, b"cert").unwrap();
         assert!(verify_message(&amk_pub, b"cert", &sig).unwrap());
+    }
+
+    // ---- helpers --------------------------------------------------------
+
+    /// A freshly created vault, parsed. Every field callers depend on.
+    struct Vault {
+        v: serde_json::Value,
+    }
+    impl Vault {
+        fn new(pw: &str) -> Vault {
+            Vault { v: serde_json::from_str(&create_vault(pw).unwrap()).unwrap() }
+        }
+        fn s(&self, k: &str) -> &str {
+            self.v[k].as_str().unwrap_or_else(|| panic!("create_vault missing string key {k}: {}", self.v))
+        }
+        /// A nested wrap object re-serialized as the JSON string the flows take.
+        fn wrap(&self, k: &str) -> String {
+            assert!(self.v.get(k).is_some(), "create_vault missing key {k}: {}", self.v);
+            serde_json::to_string(&self.v[k]).unwrap()
+        }
+        fn identity(&self) -> &str {
+            self.s("identitySecretB64")
+        }
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    /// Assert the flow's JSON has exactly the keys callers read, then return it.
+    fn json_with_keys(s: &str, keys: &[&str]) -> serde_json::Value {
+        let v = json(s);
+        for k in keys {
+            assert!(v.get(*k).is_some(), "flow output missing key {k}: {s}");
+        }
+        v
+    }
+
+    /// The `identitySecretB64` an unlock flow returns.
+    fn unlocked_identity(s: &str) -> String {
+        json_with_keys(s, &["identitySecretB64"])["identitySecretB64"].as_str().unwrap().to_string()
+    }
+
+    // ---- recovery + passphrase reset ------------------------------------
+
+    #[test]
+    fn recovery_unlock_then_reset_passphrase_chain() {
+        let vault = Vault::new("original pw");
+        let code = vault.s("recoveryCode").to_string();
+        let wrec = vault.wrap("wrappedAukRecovery");
+        let wid = vault.s("wrappedIdentity").to_string();
+        let sk = vault.s("secretKey").to_string();
+
+        // 1. Recovery code alone unlocks to the same identity.
+        let recovered = unlock_recovery(&code, &wrec, &wid).unwrap();
+        assert_eq!(unlocked_identity(&recovered), vault.identity());
+
+        // A surrounding-whitespace code is trimmed and still works.
+        let padded = format!("  {code}\n");
+        assert_eq!(unlocked_identity(&unlock_recovery(&padded, &wrec, &wid).unwrap()), vault.identity());
+
+        // A wrong recovery code does not.
+        assert!(unlock_recovery(&"B".repeat(27), &wrec, &wid).is_err());
+
+        // 2. Reset to a new passphrase using the recovery code + Secret Key.
+        let reset = reset_passphrase(&code, &wrec, &sk, "brand new pw").unwrap();
+        let new_wpp = serde_json::to_string(&json_with_keys(&reset, &["wrappedAukPassphrase"])["wrappedAukPassphrase"]).unwrap();
+
+        // 3. The new passphrase unlocks the SAME identity through the new wrap.
+        assert_eq!(unlocked_identity(&unlock_vault("brand new pw", &sk, &new_wpp, &wid).unwrap()), vault.identity());
+
+        // 4. The old passphrase no longer opens the new wrap.
+        assert!(unlock_vault("original pw", &sk, &new_wpp, &wid).is_err());
+    }
+
+    #[test]
+    fn change_passphrase_then_unlock_with_new_one() {
+        let vault = Vault::new("old pw");
+        let sk = vault.s("secretKey").to_string();
+        let wpp = vault.wrap("wrappedAukPassphrase");
+        let wid = vault.s("wrappedIdentity").to_string();
+
+        let changed = change_passphrase("old pw", &sk, &wpp, "new pw").unwrap();
+        let new_wpp = serde_json::to_string(&json_with_keys(&changed, &["wrappedAukPassphrase"])["wrappedAukPassphrase"]).unwrap();
+
+        // New passphrase opens the new wrap onto the unchanged identity.
+        assert_eq!(unlocked_identity(&unlock_vault("new pw", &sk, &new_wpp, &wid).unwrap()), vault.identity());
+        // Old passphrase does not open the new wrap.
+        assert!(unlock_vault("old pw", &sk, &new_wpp, &wid).is_err());
+        // Wrong old passphrase cannot drive the change at all.
+        assert!(change_passphrase("not the pw", &sk, &wpp, "whatever").is_err());
+    }
+
+    // ---- rotations -------------------------------------------------------
+
+    #[test]
+    fn rotate_secret_key_then_unlock_with_new_key() {
+        let vault = Vault::new("pw");
+        let old_sk = vault.s("secretKey").to_string();
+        let wpp = vault.wrap("wrappedAukPassphrase");
+        let wid = vault.s("wrappedIdentity").to_string();
+
+        let rotated = rotate_secret_key("pw", &old_sk, &wpp).unwrap();
+        let r = json_with_keys(&rotated, &["secretKey", "wrappedAukPassphrase"]);
+        let new_sk = r["secretKey"].as_str().unwrap().to_string();
+        let new_wpp = serde_json::to_string(&r["wrappedAukPassphrase"]).unwrap();
+        assert_ne!(new_sk, old_sk, "rotation must mint a fresh Secret Key");
+
+        // Same passphrase + NEW secret key opens the new wrap onto the same identity.
+        assert_eq!(unlocked_identity(&unlock_vault("pw", &new_sk, &new_wpp, &wid).unwrap()), vault.identity());
+        // The old Secret Key no longer opens the new wrap.
+        assert!(unlock_vault("pw", &old_sk, &new_wpp, &wid).is_err());
+    }
+
+    #[test]
+    fn rotate_recovery_code_then_unlock_with_new_code() {
+        let vault = Vault::new("pw");
+        let sk = vault.s("secretKey").to_string();
+        let wpp = vault.wrap("wrappedAukPassphrase");
+        let wid = vault.s("wrappedIdentity").to_string();
+        let old_code = vault.s("recoveryCode").to_string();
+
+        let rotated = rotate_recovery_code("pw", &sk, &wpp).unwrap();
+        let r = json_with_keys(&rotated, &["recoveryCode", "wrappedAukRecovery"]);
+        let new_code = r["recoveryCode"].as_str().unwrap().to_string();
+        let new_wrec = serde_json::to_string(&r["wrappedAukRecovery"]).unwrap();
+        assert_ne!(new_code, old_code, "rotation must mint a fresh recovery code");
+
+        // The new code unlocks the same identity through the new recovery wrap.
+        assert_eq!(unlocked_identity(&unlock_recovery(&new_code, &new_wrec, &wid).unwrap()), vault.identity());
+        // The old code is dead against the new wrap.
+        assert!(unlock_recovery(&old_code, &new_wrec, &wid).is_err());
+    }
+
+    #[test]
+    fn rotate_identity_then_encrypt_and_decrypt_to_new_identity() {
+        let vault = Vault::new("pw");
+        let sk = vault.s("secretKey").to_string();
+        let wpp = vault.wrap("wrappedAukPassphrase");
+        let old_wid = vault.s("wrappedIdentity").to_string();
+
+        let rotated = rotate_identity("pw", &sk, &wpp, &old_wid).unwrap();
+        let r = json_with_keys(
+            &rotated,
+            &[
+                "signPubkey",
+                "kemPubkey",
+                "wrappedIdentity",
+                "identitySecretB64",
+                "oldIdentitySecretB64",
+                "publicBlob",
+            ],
+        );
+        let new_secret = r["identitySecretB64"].as_str().unwrap().to_string();
+        let new_wid = r["wrappedIdentity"].as_str().unwrap().to_string();
+
+        // The old secret is handed back verbatim so callers can re-encrypt.
+        assert_eq!(r["oldIdentitySecretB64"].as_str().unwrap(), vault.identity());
+        assert_ne!(new_secret, vault.identity(), "rotation must mint a fresh identity");
+
+        // The returned publicBlob is a usable recipient: encrypt to it, decrypt with the new secret.
+        let recipients = format!("[{}]", serde_json::to_string(&r["publicBlob"]).unwrap());
+        let item = encrypt_item("ROTATED=yes", &recipients).unwrap();
+        assert_eq!(decrypt_item(&item, &new_secret).unwrap(), "ROTATED=yes");
+        // The pre-rotation identity cannot read an item sealed to the new one.
+        assert!(decrypt_item(&item, vault.identity()).is_err());
+
+        // The new wrappedIdentity unwraps under the unchanged AUK to the new secret.
+        assert_eq!(unlocked_identity(&unlock_vault("pw", &sk, &wpp, &new_wid).unwrap()), new_secret);
+    }
+
+    // ---- backup ----------------------------------------------------------
+
+    #[test]
+    fn backup_export_import_roundtrip() {
+        let payload = r#"{"v":1,"items":[{"name":"prod .env","value":"API_KEY=abc123"}]}"#;
+        let blob = export_backup(payload, "backup pw").unwrap();
+
+        assert!(!blob.is_empty());
+        // The plaintext must not survive anywhere in the encrypted blob.
+        assert!(
+            blob.windows(payload.len()).all(|w| w != payload.as_bytes()),
+            "backup blob leaks plaintext"
+        );
+
+        assert_eq!(import_backup(&blob, "backup pw").unwrap(), payload);
+        assert!(import_backup(&blob, "wrong pw").is_err());
+
+        // A tampered byte in the ciphertext body must fail the AEAD tag.
+        let mut tampered = blob.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(import_backup(&tampered, "backup pw").is_err());
+    }
+
+    // ---- symmetric AEAD --------------------------------------------------
+
+    #[test]
+    fn symmetric_seal_open_roundtrip_and_aad_binding() {
+        let key = generate_symmetric_key();
+        assert_eq!(unb64(&key).unwrap().len(), 32, "symmetric key must be 32 bytes");
+
+        let plaintext = b"channel message body";
+        let aad = b"chan_123|v1|user_abc";
+        let blob = seal_symmetric(&key, plaintext, aad).unwrap();
+
+        assert!(blob.len() > plaintext.len(), "sealed blob carries nonce + tag");
+        assert!(blob.windows(plaintext.len()).all(|w| w != plaintext), "sealed blob leaks plaintext");
+
+        // Same key + same AAD round-trips.
+        assert_eq!(open_symmetric(&key, &blob, aad).unwrap(), plaintext);
+
+        // AAD is authenticated: a different context must not open the blob.
+        assert!(open_symmetric(&key, &blob, b"chan_123|v2|user_abc").is_err());
+        assert!(open_symmetric(&key, &blob, b"").is_err());
+
+        // A different key must not open it either.
+        let other = generate_symmetric_key();
+        assert_ne!(other, key, "keys must be random");
+        assert!(open_symmetric(&other, &blob, aad).is_err());
+
+        // Tampered ciphertext fails the tag.
+        let mut tampered = blob.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(open_symmetric(&key, &tampered, aad).is_err());
+
+        // Empty plaintext is still a valid sealed blob.
+        let empty = seal_symmetric(&key, b"", aad).unwrap();
+        assert_eq!(open_symmetric(&key, &empty, aad).unwrap(), Vec::<u8>::new());
     }
 }

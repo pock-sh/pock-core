@@ -200,10 +200,8 @@ pub fn wasm_unlock_prf(
 
 // ---- Account Master Key (AMK) -------------------------------------------------
 //
-// The AMK is a random Ed25519 key sealed under the AUK — the passphrase/passkey-
-// gated root of trust. The AUK is derived inside WASM and never crosses the
-// boundary; AMK functions take unlock inputs and return only the AMK public key +
-// the AUK-sealed `wrappedAmk` blob, or a signature.
+// See `crate::flows` for how the AMK is sealed under the AUK and why the AUK
+// never crosses the binding boundary.
 
 /// Create-or-load the Account Master Key (Ed25519) sealed under the AUK
 /// (passphrase path). Returns JSON `{ "amkPub": b64, "wrappedAmk": b64 }`.
