@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo test --features uniffi
+      # `wasm` and `uniffi` are orthogonal and must never be enabled together,
+      # so there is no `--all-features` pass: each feature is linted against the
+      # target it actually ships to.
+      - run: cargo clippy --features uniffi --all-targets -- -D warnings
+      - run: cargo clippy --features wasm --target wasm32-unknown-unknown -- -D warnings
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      # wasm-pack passes everything after `--` to cargo; the flags cannot be
+      # interleaved or cargo is handed wasm-pack's own options.
+      - run: wasm-pack test --node -- --features wasm
+      - run: ./scripts/pack-wasm.sh
+
+  xcframework:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          if [ -d /Applications/Xcode_16.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.3.app
+          fi
+          xcodebuild -version
+      - run: ./scripts/build-xcframework.sh
+      - name: Run the XCTest suite on a simulator
+        run: |
+          set -o pipefail
+          AVAILABLE=$(xcrun simctl list devices available \
+            | sed -n 's/^ *\(iPhone[^(]*\) (.*/\1/p' | sed 's/ *$//')
+          printf 'available iPhones:\n%s\n' "$AVAILABLE"
+          DEVICE=$(printf '%s\n' "$AVAILABLE" | grep -x 'iPhone 16' \
+            || printf '%s\n' "$AVAILABLE" | head -1)
+          if [ -z "$DEVICE" ]; then
+            echo "no iPhone simulator available on this runner" >&2
+            exit 1
+          fi
+          echo "testing on: $DEVICE"
+          xcodebuild test -scheme PockCore \
+            -destination "platform=iOS Simulator,name=$DEVICE" | tail -20

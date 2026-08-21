@@ -1,4 +1,3 @@
-#![cfg(feature = "wasm")]
 //! wasm-bindgen adapters. Every function here is a one-line delegation to
 //! `crate::flows`; all logic lives there so the wasm, UniFFI and native
 //! surfaces stay byte-for-byte identical.

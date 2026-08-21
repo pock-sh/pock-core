@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: ./scripts/pack-wasm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: "*.tgz"
+
+  xcframework:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          if [ -d /Applications/Xcode_16.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.3.app
+          fi
+          xcodebuild -version
+      - run: ./scripts/build-xcframework.sh
+      # `-y` keeps the symlinks inside the framework intact; the checksum is the
+      # plain sha256 of the zip, which is exactly what SwiftPM verifies.
+      - run: |
+          zip -r -y PockCoreFFI.xcframework.zip PockCoreFFI.xcframework
+          shasum -a 256 PockCoreFFI.xcframework.zip > PockCoreFFI.xcframework.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframework
+          path: "PockCoreFFI.xcframework.zip*"
+
+  publish:
+    needs: [wasm, xcframework]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: |
+          gh release create "$GITHUB_REF_NAME" \
+            *.tgz PockCoreFFI.xcframework.zip PockCoreFFI.xcframework.zip.sha256 \
+            --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # SwiftPM resolves the tag, so the tag has to end up on the commit whose
+      # Package.swift points at the uploaded zip. The branch keeps that rewrite
+      # reviewable; the tag is then force-moved onto it.
+      - name: Pin Package.swift to the release binary
+        run: |
+          SUM=$(cut -d' ' -f1 PockCoreFFI.xcframework.zip.sha256)
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/PockCoreFFI.xcframework.zip"
+          # Anchored to the whole binaryTarget line so nothing else in the
+          # manifest (notably `// swift-tools-version:5.9`) can be rewritten.
+          sed -i "s|^\( *\)\.binaryTarget(name: \"PockCoreFFI\", path: \"PockCoreFFI\.xcframework\"),\$|\1.binaryTarget(name: \"PockCoreFFI\", url: \"${URL}\", checksum: \"${SUM}\"),|" Package.swift
+          grep -q "^// swift-tools-version:5.9\$" Package.swift
+          grep -q "checksum: \"${SUM}\"" Package.swift
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git checkout -b "release/${GITHUB_REF_NAME}"
+          git commit -am "release: pin Package.swift to ${GITHUB_REF_NAME}"
+          git push origin "release/${GITHUB_REF_NAME}"
+          git tag -f "${GITHUB_REF_NAME}"
+          git push -f origin "${GITHUB_REF_NAME}"
