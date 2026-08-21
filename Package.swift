@@ -10,7 +10,7 @@ let package = Package(
     platforms: [.iOS("18.0"), .macOS(.v14)],
     products: [.library(name: "PockCore", targets: ["PockCore"])],
     targets: [
-        .binaryTarget(name: "PockCoreFFI", path: "PockCoreFFI.xcframework"),
+        .binaryTarget(name: "PockCoreFFI", url: "https://github.com/pock-sh/pock-core/releases/download/v0.2.0/PockCoreFFI.xcframework.zip", checksum: "c263cddbf48fad3a08f2210f39dba816447f08d25c7269ec31d481ae828c1184"),
         .target(name: "PockCore", dependencies: ["PockCoreFFI"], path: "swift/Sources/PockCore"),
         .testTarget(name: "PockCoreTests", dependencies: ["PockCore"], path: "swift/Tests/PockCoreTests"),
     ]
